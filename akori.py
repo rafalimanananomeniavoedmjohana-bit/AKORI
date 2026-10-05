@@ -790,7 +790,7 @@ def _extract_json_from_text(text):
     return None
 
 
-def _gemini_structured(prompt, system_instruction):
+def _gemini_structured(prompt, system_instruction, max_tokens=900):
     """Génération JSON avec secours rapide en cas de 503.
 
     On évite une longue chaîne de retries : le modèle principal est essayé
@@ -810,7 +810,7 @@ def _gemini_structured(prompt, system_instruction):
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
-                    max_output_tokens=900,
+                    max_output_tokens=max_tokens,
                     response_mime_type="application/json",
                 ),
             )
@@ -964,38 +964,60 @@ running ? start() : stop();
     return f'<iframe srcdoc="{safe_html}" style="width:100%;height:450px;border:none;overflow:hidden;background:transparent;"></iframe>'
 
 
+MIN_FLASHCARDS = 7
+GENERATE_LABEL = "✦ Générer les flashcards"
+REGENERATE_LABEL = "🔄 Régénérer (7 minimum)"
+
+
+def _flash_generate_fail(message):
+    return [], 0, False, flashcard_view([], 0, False), message, gr.update(visible=False), gr.update(value=GENERATE_LABEL)
+
+
 def flashcard_generate_handler(doc_name):
+    """Génère une NOUVELLE série (7 flashcards minimum) à chaque appel."""
     if not doc_name or doc_name not in documents_db:
-        return [], 0, False, flashcard_view([], 0, False), "⚠️ Aucun document sélectionné."
+        return _flash_generate_fail("⚠️ Aucun document sélectionné.")
 
     document = documents_db[doc_name]
-    cards = normalize_flashcards(document.get("flashcards", []))
+    context = "\n\n".join(preparer_contexte_global(document))
+    if not context.strip():
+        return _flash_generate_fail("❌ Document vide.")
 
-    if not cards:
+    cards = []
+    last_error = None
+    for attempt in range(2):
         try:
-            context = "\n\n".join(preparer_contexte_global(document))
-            if not context.strip():
-                return [], 0, False, flashcard_view([], 0, False), "❌ Document vide."
             prompt = f"""CONTEXTE DU COURS:\n{context}\n\n
-Crée au moins 7 flashcards (questions/réponses) pour réviser les concepts clés de ce cours.
+Crée {MIN_FLASHCARDS + 1} flashcards (questions/réponses courtes) pour réviser les concepts clés de ce cours.
+Il en faut au moins {MIN_FLASHCARDS}, avec des questions toutes différentes.
 Retourne UNIQUEMENT un JSON valide avec la structure exacte suivante :
 {{"flashcards": [{{"question": "...", "answer": "..."}}]}}"""
             raw = _gemini_structured(
-                prompt, "Tu es AKORI, assistant académique. Base-toi uniquement sur le contexte fourni et n'invente rien.")
+                prompt,
+                "Tu es AKORI, assistant académique. Base-toi uniquement sur le contexte fourni et n'invente rien.",
+                max_tokens=2500,
+            )
             data = _extract_json_from_text(raw)
+            found = []
             if isinstance(data, dict):
-                cards = data.get("flashcards") or data.get("cards") or []
-            cards = normalize_flashcards(cards)
-            if cards:
-                document["flashcards"] = cards
+                found = data.get("flashcards") or data.get("cards") or []
+            cards = normalize_flashcards(found)
+            if len(cards) >= MIN_FLASHCARDS:
+                break
         except Exception as e:
-            return [], 0, False, flashcard_view([], 0, False), f"❌ Erreur : {e}"
+            last_error = e
+            break
 
-    if not cards:
-        return [], 0, False, flashcard_view([], 0, False), "❌ Le modèle n'a renvoyé aucune flashcard valide."
+    if last_error is not None and not cards:
+        return _flash_generate_fail(f"❌ Erreur : {last_error}")
+    if len(cards) < MIN_FLASHCARDS:
+        return _flash_generate_fail(
+            f"⚠️ Seulement {len(cards)} flashcard(s) obtenue(s) : il en faut au moins {MIN_FLASHCARDS}. Relancez la génération.")
 
+    document["flashcards"] = cards
     view = flashcard_view(cards, 0, False, doc_name, get_flashcard_results(doc_name, cards))
-    return cards, 0, False, view, f"✅ {len(cards)} flashcards prêtes !"
+    return (cards, 0, False, view, f"✅ {len(cards)} flashcards prêtes !",
+            gr.update(visible=True), gr.update(value=GENERATE_LABEL))
 
 
 def flashcard_reveal_handler(cards, index, doc_name):
@@ -1016,6 +1038,7 @@ def flashcard_end_game_view(doc_name, total, known_count, review_count):
         <div><b>{known_count}</b><span>Maîtrisées</span></div>
         <div><b>{review_count}</b><span>À revoir</span></div>
       </div>
+      <p style="margin-top:18px;">Cliquez sur <b>« 🔄 Régénérer (7 minimum) »</b> pour obtenir une nouvelle série.</p>
     </div>
     """
 
@@ -1023,16 +1046,21 @@ def flashcard_end_game_view(doc_name, total, known_count, review_count):
 def flashcard_mark_handler(cards, index, mark_type, doc_name):
     cards = normalize_flashcards(cards)
     if not cards:
-        return 0, False, flashcard_view([], 0, False)
+        return 0, False, flashcard_view([], 0, False), gr.update(visible=False), gr.update()
     index = int(index)
-    if index < len(cards):
-        save_flashcard_result(doc_name, cards[index]["question"], mark_type)
+    if index >= len(cards):
+        # Session déjà terminée : rien d'autre à faire que régénérer.
+        return index, False, gr.update(), gr.update(visible=False), gr.update(value=REGENERATE_LABEL)
+    save_flashcard_result(doc_name, cards[index]["question"], mark_type)
     next_index = index + 1
     results = get_flashcard_results(doc_name, cards)
     if next_index >= len(cards):
         st = flashcard_statistics(cards, results)
-        return next_index, False, flashcard_end_game_view(doc_name, st["total"], st["known"], st["review"])
-    return next_index, False, flashcard_view(cards, next_index, False, doc_name, results)
+        return (next_index, False,
+                flashcard_end_game_view(doc_name, st["total"], st["known"], st["review"]),
+                gr.update(visible=False), gr.update(value=REGENERATE_LABEL))
+    return (next_index, False, flashcard_view(cards, next_index, False, doc_name, results),
+            gr.update(visible=True), gr.update())
 
 
 # ============================================================
@@ -1889,26 +1917,75 @@ body.akori-dark #add-document-tile .wrap { background:transparent!important; }
 
 /* cartes flashcards (iframe) : inversion douce */
 body.akori-dark iframe { filter:invert(.92) hue-rotate(180deg); }
+
+/* ===== Tuile « Ajouter un document » ===== */
+#add-document-tile, #add-document-tile.gr-button, button#add-document-tile {
+  background:#111827!important;background-image:none!important;
+  border:2px solid #1f2937!important;border-radius:18px!important;
+  min-height:142px!important;height:100%!important;width:100%!important;
+  display:flex!important;flex-direction:column!important;align-items:center!important;justify-content:center!important;
+  white-space:pre-line!important;text-align:center!important;line-height:1.5!important;
+  color:#ffffff!important;-webkit-text-fill-color:#ffffff!important;
+  font-size:15px!important;font-weight:600!important;
+  box-shadow:0 10px 25px rgba(17,24,39,.2)!important;
+  transition:transform .2s ease,border-color .2s ease,box-shadow .2s ease!important;cursor:pointer;
+}
+#add-document-tile::first-line { font-size:34px;font-weight:300;line-height:1.3; }
+#add-document-tile:hover { border-color:#4f6df5!important;transform:translateY(-2px);box-shadow:0 14px 30px rgba(79,109,245,.25)!important; }
+#add-document-tile * { color:#fff!important;-webkit-text-fill-color:#fff!important; }
+
+/* ===== Menu latéral « rideau » ===== */
+#sidebar-toggle, #sidebar-toggle.gr-button { max-width:56px!important;min-width:48px!important;font-size:20px!important;padding:0!important; }
+#sidebar {
+  overflow-x:hidden!important;
+  transition:flex-grow .38s cubic-bezier(.65,0,.35,1), min-width .38s cubic-bezier(.65,0,.35,1),
+             max-width .38s cubic-bezier(.65,0,.35,1), padding .38s ease, opacity .25s ease,
+             margin .38s ease, border-width .38s ease;
+}
+#sidebar > * { transition:opacity .2s ease .12s, transform .38s cubic-bezier(.65,0,.35,1); }
+body.sidebar-collapsed #sidebar {
+  flex-grow:0!important;flex-basis:0!important;min-width:0!important;max-width:0!important;width:0!important;
+  padding-left:0!important;padding-right:0!important;margin-right:-12px!important;
+  border-width:0!important;opacity:0;pointer-events:none;
+}
+body.sidebar-collapsed #sidebar > * { opacity:0;transform:translateX(-40px); }
+
+/* ===== Choix du thème ===== */
+#theme-choice .wrap { display:flex!important;gap:10px!important; }
+#theme-choice label { flex:1;border:1.5px solid #dfe5ef!important;border-radius:14px!important;padding:14px 18px!important;cursor:pointer;font-weight:650; }
+#theme-choice label:has(input:checked) { border-color:#4f46e5!important;background:#eef2ff!important; }
+body.akori-dark #theme-choice label { border-color:#2c3957!important;background:#1b2438!important;color:#e6ebf7!important; }
+body.akori-dark #theme-choice label:has(input:checked) { border-color:#7b8ff7!important;background:#232f55!important; }
 """
 
 
-THEME_TOGGLE_JS = r"""
-() => {
-  const dark = !document.body.classList.contains('akori-dark');
+THEME_APPLY_JS = r"""
+(choice) => {
+  const dark = String(choice).includes('Sombre');
   document.body.classList.toggle('akori-dark', dark);
   document.body.classList.toggle('dark', dark);
   try { localStorage.setItem('akori-theme', dark ? 'dark' : 'light'); } catch (e) {}
-  return dark ? '☀️ Thème clair' : '🌙 Thème sombre';
 }
 """
 
 THEME_INIT_JS = r"""
 () => {
-  let dark = false;
-  try { dark = localStorage.getItem('akori-theme') === 'dark'; } catch (e) {}
+  let dark = false, collapsed = false;
+  try {
+    dark = localStorage.getItem('akori-theme') === 'dark';
+    collapsed = localStorage.getItem('akori-sidebar') === 'closed';
+  } catch (e) {}
   document.body.classList.toggle('akori-dark', dark);
   document.body.classList.toggle('dark', dark);
-  return dark ? '☀️ Thème clair' : '🌙 Thème sombre';
+  document.body.classList.toggle('sidebar-collapsed', collapsed);
+  return dark ? '🌙 Sombre' : '☀️ Clair';
+}
+"""
+
+SIDEBAR_TOGGLE_JS = r"""
+() => {
+  const closed = document.body.classList.toggle('sidebar-collapsed');
+  try { localStorage.setItem('akori-sidebar', closed ? 'closed' : 'open'); } catch (e) {}
 }
 """
 
@@ -1959,14 +2036,15 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
             nav_progress = gr.Button("↗  Progression", elem_classes="navbtn")
             nav_reviewq = gr.Button("!  À revoir", elem_classes="navbtn")
             nav_history = gr.Button("◷  Historique", elem_classes="navbtn")
+            nav_settings = gr.Button("⚙  Paramètres", elem_classes="navbtn")
             gr.Markdown("---")
             gr.Markdown("<div class='sidebar-note'>Vos documents, historiques et progressions sont conservés localement dans AKORI.</div>")
 
         with gr.Column(scale=4, elem_id="main-column"):
             with gr.Row(elem_id="topbar"):
+                menu_btn = gr.Button("☰", elem_id="sidebar-toggle", scale=0, min_width=52)
                 gr.Markdown("### AKORI · Espace de révision")
                 doc_selector = gr.Dropdown(label="Cours actif", choices=list(documents_db.keys()), value=(next(iter(documents_db), None)), scale=2)
-                theme_btn = gr.Button("🌙 Thème sombre", elem_id="theme-toggle", scale=0)
 
             with gr.Tabs(elem_id="main-tabs") as tabs:
                 with gr.Tab("Accueil", id="home") as tab_home:
@@ -1978,8 +2056,8 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
                     gr.Markdown("Tous vos supports PDF sont centralisés ici. Dès qu'un document est sélectionné, AKORI extrait son contenu et construit automatiquement son index.")
                     with gr.Row(elem_id="documents-row", equal_height=True):
                         docs_html = gr.HTML(documents_html_v16(doc_selector.value), scale=3)
-                        pdf_input = gr.File(
-                            label="➕ Ajouter un document",
+                        pdf_input = gr.UploadButton(
+                            "＋\nAjouter un document",
                             file_types=[".pdf"],
                             file_count="single",
                             type="filepath",
@@ -2006,11 +2084,11 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
                         generate_flash = gr.Button("✦ Générer les flashcards", variant="primary")
                         flash_status = gr.Markdown("", elem_id="flash-status")
                     flash_view = gr.HTML(flashcard_view([], 0, False))
-                    with gr.Row():
+                    with gr.Column(visible=False) as flash_actions:
                         flash_reveal = gr.Button("Afficher la réponse", variant="primary")
-                    with gr.Row():
-                        flash_known = gr.Button("✓ Je savais", variant="primary")
-                        flash_review = gr.Button("↻ À revoir")
+                        with gr.Row():
+                            flash_known = gr.Button("✓ Je savais", variant="primary")
+                            flash_review = gr.Button("↻ À revoir")
 
                 with gr.Tab("Quiz / QCM", id="quiz"):
                     gr.Markdown("## Quiz d'évaluation")
@@ -2065,12 +2143,22 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
                     gr.Markdown("Cette section regroupera les flashcards marquées « À revoir » et les erreurs de quiz.")
                     review_queue = gr.HTML("<div class='empty-study'>📌 Votre file « À revoir » apparaîtra ici après les interactions.</div>")
 
+                with gr.Tab("Paramètres", id="settings"):
+                    gr.Markdown("## Paramètres")
+                    gr.Markdown("### Apparence")
+                    theme_choice = gr.Radio(
+                        choices=["☀️ Clair", "🌙 Sombre"], value="☀️ Clair",
+                        label="Thème de l'interface", elem_id="theme-choice",
+                    )
+                    gr.Markdown("Votre choix est mémorisé dans ce navigateur. Le bouton ☰ en haut à gauche ouvre et ferme le menu latéral.")
+
                 with gr.Tab("Historique", id="history"):
                     gr.Markdown("## Historique du cours actif")
                     history_box = gr.HTML(history_view(doc_selector.value))
 
     # Upload : la sélection du PDF déclenche directement extraction + chunking + indexation.
     def upload_and_refresh(file_path):
+        file_path = getattr(file_path, "name", file_path)
         status, selector_update, _ = ajouter_et_indexer_pdf(file_path)
         selected = os.path.basename(file_path) if file_path else None
         # The upload event updates every dependent view in one transaction.
@@ -2085,7 +2173,7 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
 
     # Stage 1: immediate visual feedback. Stage 2: extraction + chunking +
     # embeddings + FAISS, with the selected PDF becoming the active course.
-    upload_event = pdf_input.change(
+    upload_event = pdf_input.upload(
         lambda: "⏳ Analyse du PDF… extraction, découpage et indexation en cours.",
         inputs=None, outputs=[upload_status], queue=False
     )
@@ -2112,6 +2200,7 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
     nav_progress.click(lambda: gr.Tabs(selected="progress"), outputs=tabs)
     nav_reviewq.click(lambda: gr.Tabs(selected="reviewq"), outputs=tabs)
     nav_history.click(lambda: gr.Tabs(selected="history"), outputs=tabs)
+    nav_settings.click(lambda: gr.Tabs(selected="settings"), outputs=tabs)
     start_review.click(lambda: gr.Tabs(selected="review"), outputs=tabs)
     review_flash.click(lambda: gr.Tabs(selected="flashcards"), outputs=tabs)
     review_quiz.click(lambda: gr.Tabs(selected="quiz"), outputs=tabs)
@@ -2151,7 +2240,7 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
     ).then(
         flashcard_generate_handler,
         inputs=[doc_selector],
-        outputs=[flashcards_state, flash_index, flash_revealed, flash_view, flash_status],
+        outputs=[flashcards_state, flash_index, flash_revealed, flash_view, flash_status, flash_actions, generate_flash],
         show_progress="minimal",
         concurrency_limit=1,
     )
@@ -2164,13 +2253,13 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
     flash_known.click(
         lambda c, i, d: flashcard_mark_handler(c, i, "known", d),
         inputs=[flashcards_state, flash_index, doc_selector],
-        outputs=[flash_index, flash_revealed, flash_view],
+        outputs=[flash_index, flash_revealed, flash_view, flash_actions, generate_flash],
         queue=False,
     ).then(lambda d: (global_progress_html(d), progress_detail_html(d)), inputs=[doc_selector], outputs=[global_progress_output, progress_output], queue=False)
     flash_review.click(
         lambda c, i, d: flashcard_mark_handler(c, i, "review", d),
         inputs=[flashcards_state, flash_index, doc_selector],
-        outputs=[flash_index, flash_revealed, flash_view],
+        outputs=[flash_index, flash_revealed, flash_view, flash_actions, generate_flash],
         queue=False,
     ).then(lambda d: (global_progress_html(d), progress_detail_html(d)), inputs=[doc_selector], outputs=[global_progress_output, progress_output], queue=False)
 
@@ -2194,8 +2283,9 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
     ).then(lambda d: (global_progress_html(d), progress_detail_html(d)), inputs=[doc_selector], outputs=[global_progress_output, progress_output], queue=False)
 
     # Thème clair / sombre (mémorisé dans le navigateur)
-    theme_btn.click(None, None, theme_btn, js=THEME_TOGGLE_JS)
-    demo.load(None, None, theme_btn, js=THEME_INIT_JS)
+    theme_choice.input(None, theme_choice, None, js=THEME_APPLY_JS)
+    menu_btn.click(None, None, None, js=SIDEBAR_TOGGLE_JS)
+    demo.load(None, None, theme_choice, js=THEME_INIT_JS)
 
     # Résumé — conserve le comportement existant, mais l'affiche dans son propre espace.
     def summary_handler(d):
