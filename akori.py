@@ -22,6 +22,18 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 client = genai.Client(api_key=GEMINI_API_KEY)
 MODEL_NAME = "gemini-3.5-flash-lite"
 FALLBACK_MODEL_NAME = "gemini-3.1-flash-lite"  # Secours gratuit, si accessible au projet.
+EXTRA_FALLBACK_MODELS = [
+    m.strip() for m in os.getenv("GEMINI_EXTRA_FALLBACKS", "gemini-2.5-flash-lite").split(",") if m.strip()
+]
+
+
+def _models_chain():
+  """Modèle principal puis modèles de secours, sans doublon."""
+  chain = []
+  for name in [MODEL_NAME, FALLBACK_MODEL_NAME, *EXTRA_FALLBACK_MODELS]:
+    if name and name not in chain:
+      chain.append(name)
+  return chain
 
 GEMINI_MIN_REQUEST_INTERVAL = float(
     os.getenv("GEMINI_MIN_REQUEST_INTERVAL", "0.3")
@@ -467,9 +479,7 @@ def _appel_gemini_securise(user_prompt, system_instruction, max_retries=2):
 
   Bascule sur le modèle de secours si nécessaire.
   """
-  models_to_try = [MODEL_NAME]
-  if FALLBACK_MODEL_NAME and FALLBACK_MODEL_NAME != MODEL_NAME:
-    models_to_try.append(FALLBACK_MODEL_NAME)
+  models_to_try = _models_chain()
 
   for model_target in models_to_try:
     for attempt in range(max_retries):
@@ -791,47 +801,47 @@ def _extract_json_from_text(text):
 
 
 def _gemini_structured(prompt, system_instruction, max_tokens=900):
-    """Génération JSON avec secours rapide en cas de 503.
+    """Génération JSON résiliente.
 
-    On évite une longue chaîne de retries : le modèle principal est essayé
-    une fois, puis le modèle de secours gratuit est essayé une fois si le
-    service principal renvoie 503 UNAVAILABLE.
+    Chaque modèle est réessayé avec une courte attente progressive en cas de
+    surcharge (503/500) ou de limite (429), puis on bascule sur le modèle de
+    secours suivant. L'erreur n'est montrée qu'une fois tous les essais épuisés.
     """
-    models = [MODEL_NAME]
-    if FALLBACK_MODEL_NAME and FALLBACK_MODEL_NAME != MODEL_NAME:
-        models.append(FALLBACK_MODEL_NAME)
-
+    attempts_per_model = 3
     last_error = None
-    for pos, model_target in enumerate(models):
-        try:
-            _wait_before_gemini_request()
-            response = client.models.generate_content(
-                model=model_target,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    max_output_tokens=max_tokens,
-                    response_mime_type="application/json",
-                ),
-            )
-            return (response.text or "").strip()
-        except APIError as e:
-            last_error = e
-            if e.code == 503 and pos < len(models) - 1:
-                print(f"⚠️ {model_target} indisponible (503). Passage au modèle de secours {models[pos+1]}.")
-                time.sleep(1.2)
-                continue
-            if e.code == 429:
-                raise RuntimeError(
-                    "Quota ou limite temporaire Gemini atteinte. Attendez un peu avant de relancer la génération."
-                ) from e
-            if e.code == 503:
-                raise RuntimeError(
-                    "Gemini est temporairement surchargé. Réessayez dans quelques secondes."
-                ) from e
-            raise
+    for model_target in _models_chain():
+        for attempt in range(attempts_per_model):
+            try:
+                _wait_before_gemini_request()
+                response = client.models.generate_content(
+                    model=model_target,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        max_output_tokens=max_tokens,
+                        response_mime_type="application/json",
+                    ),
+                )
+                return (response.text or "").strip()
+            except APIError as e:
+                last_error = e
+                if e.code not in (429, 500, 503, 504):
+                    # Modèle inconnu (404) : on tente directement le suivant ; autre erreur : on remonte.
+                    if e.code == 404:
+                        break
+                    raise
+                if attempt < attempts_per_model - 1:
+                    time.sleep(1.2 * (2 ** attempt) + random.uniform(0.1, 0.5))
+                else:
+                    print(f"⚠️ {model_target} indisponible ({e.code}). Passage au modèle suivant.")
 
-    raise RuntimeError("Le service Gemini est temporairement indisponible.") from last_error
+    if last_error is not None and getattr(last_error, "code", None) == 429:
+        raise RuntimeError(
+            "Quota ou limite temporaire Gemini atteinte. Attendez un peu avant de relancer la génération."
+        ) from last_error
+    raise RuntimeError(
+        "Gemini est très sollicité en ce moment. Réessayez dans une dizaine de secondes."
+    ) from last_error
 
 
 def generate_flashcards_v12(doc_name, count=6):
@@ -1915,6 +1925,9 @@ body.akori-dark .folder-card:hover { border-color:#3b4b7a!important; }
 body.akori-dark .folder-card.active-course { border-color:#7b8ff7!important;box-shadow:0 0 0 2px #1f2a4d; }
 body.akori-dark #add-document-tile .wrap { background:transparent!important; }
 
+body.akori-dark #sidebar:hover { box-shadow:0 18px 50px rgba(0,0,0,.55)!important; }
+body.akori-dark #sidebar .navbtn::before { color:inherit; }
+
 /* cartes flashcards (iframe) : inversion douce */
 body.akori-dark iframe { filter:invert(.92) hue-rotate(180deg); }
 
@@ -1934,21 +1947,76 @@ body.akori-dark iframe { filter:invert(.92) hue-rotate(180deg); }
 #add-document-tile:hover { border-color:#4f6df5!important;transform:translateY(-2px);box-shadow:0 14px 30px rgba(79,109,245,.25)!important; }
 #add-document-tile * { color:#fff!important;-webkit-text-fill-color:#fff!important; }
 
-/* ===== Menu latéral « rideau » ===== */
-#sidebar-toggle, #sidebar-toggle.gr-button { max-width:56px!important;min-width:48px!important;font-size:20px!important;padding:0!important; }
+
+/* ===== Menu latéral : rail d'icônes + ouverture au survol ===== */
+#nav-home::before { content:"⌂"; }
+#nav-courses::before { content:"▣"; }
+#nav-review::before { content:"◈"; }
+#nav-flash::before { content:"▤"; }
+#nav-quiz::before { content:"☷"; }
+#nav-summary::before { content:"≡"; }
+#nav-assistant::before { content:"✦"; }
+#nav-progress::before { content:"↗"; }
+#nav-reviewq::before { content:"!"; }
+#nav-history::before { content:"◷"; }
+#nav-settings::before { content:"⚙"; }
+
 #sidebar {
-  overflow-x:hidden!important;
-  transition:flex-grow .38s cubic-bezier(.65,0,.35,1), min-width .38s cubic-bezier(.65,0,.35,1),
-             max-width .38s cubic-bezier(.65,0,.35,1), padding .38s ease, opacity .25s ease,
-             margin .38s ease, border-width .38s ease;
+  display:flex!important;flex-direction:column!important;gap:2px!important;--layout-gap:2px;
+  z-index:60;
+  transition:flex-basis .3s cubic-bezier(.4,0,.2,1), min-width .3s cubic-bezier(.4,0,.2,1),
+             max-width .3s cubic-bezier(.4,0,.2,1), margin .3s cubic-bezier(.4,0,.2,1),
+             padding .3s ease, box-shadow .3s ease;
 }
-#sidebar > * { transition:opacity .2s ease .12s, transform .38s cubic-bezier(.65,0,.35,1); }
+#sidebar .block { padding:0!important;margin:0!important;border:0!important;min-height:0!important; }
+#sidebar .navbtn {
+  display:flex!important;align-items:center!important;justify-content:flex-start!important;gap:12px!important;
+  min-height:40px!important;margin:1px 0!important;padding:0 12px!important;white-space:nowrap;overflow:hidden;
+}
+#sidebar .navbtn::before { display:inline-block;width:24px;flex:none;text-align:center;font-size:17px;line-height:1; }
+#sidebar #nav-settings { margin-top:auto!important;border-top:1px solid var(--ak-line)!important;border-radius:11px!important; }
+#sidebar .sidebar-note { margin-top:8px!important; }
+
+/* bouton ☰ placé dans le sidebar */
+#sidebar #sidebar-toggle {
+  width:44px!important;min-width:44px!important;max-width:44px!important;height:40px!important;
+  padding:0!important;font-size:20px!important;align-self:flex-start;margin:0 0 6px 2px!important;
+  display:flex!important;align-items:center!important;justify-content:center!important;
+}
+#sidebar .brand { margin:2px 4px 14px!important;white-space:nowrap; }
+
+/* état replié : seules les icônes restent visibles */
 body.sidebar-collapsed #sidebar {
-  flex-grow:0!important;flex-basis:0!important;min-width:0!important;max-width:0!important;width:0!important;
-  padding-left:0!important;padding-right:0!important;margin-right:-12px!important;
-  border-width:0!important;opacity:0;pointer-events:none;
+  flex:0 0 72px!important;min-width:72px!important;max-width:72px!important;
+  padding-left:10px!important;padding-right:10px!important;overflow-x:hidden!important;
 }
-body.sidebar-collapsed #sidebar > * { opacity:0;transform:translateX(-40px); }
+body.sidebar-collapsed #sidebar:not(:hover) .navbtn { font-size:0!important;justify-content:center!important;gap:0!important;padding:0!important; }
+body.sidebar-collapsed #sidebar:not(:hover) #sidebar-toggle { align-self:center; margin-left:0!important; }
+body.sidebar-collapsed #sidebar:not(:hover) .brand-name,
+body.sidebar-collapsed #sidebar:not(:hover) .brand-sub,
+body.sidebar-collapsed #sidebar:not(:hover) .nav-title,
+body.sidebar-collapsed #sidebar:not(:hover) .sidebar-note { display:none!important; }
+body.sidebar-collapsed #sidebar:not(:hover) .brand { justify-content:center;margin-left:0!important;margin-right:0!important; }
+
+/* survol du rail : le menu s'ouvre PAR-DESSUS la page (pas de décalage) puis se referme */
+body.sidebar-collapsed #sidebar:hover {
+  flex-basis:270px!important;min-width:270px!important;max-width:270px!important;margin-right:-198px!important;
+  box-shadow:0 18px 50px rgba(30,41,80,.22)!important;
+}
+
+/* écrans étroits : rail par défaut, ouverture en surimpression */
+@media (max-width:900px) {
+  #sidebar { flex:0 0 72px!important;min-width:72px!important;max-width:72px!important;padding-left:10px!important;padding-right:10px!important; }
+  body:not(.sidebar-collapsed) #sidebar {
+    flex-basis:270px!important;min-width:270px!important;max-width:270px!important;margin-right:-198px!important;
+    box-shadow:0 18px 50px rgba(30,41,80,.22)!important;
+  }
+  .gradio-container { padding:10px!important; }
+}
+@media (max-width:600px) {
+  #topbar { flex-wrap:wrap!important; }
+  .hero { padding:20px!important; }
+}
 
 /* ===== Choix du thème ===== */
 #theme-choice .wrap { display:flex!important;gap:10px!important; }
@@ -1970,14 +2038,26 @@ THEME_APPLY_JS = r"""
 
 THEME_INIT_JS = r"""
 () => {
-  let dark = false, collapsed = false;
+  let dark = false, pref = null;
   try {
     dark = localStorage.getItem('akori-theme') === 'dark';
-    collapsed = localStorage.getItem('akori-sidebar') === 'closed';
+    pref = localStorage.getItem('akori-sidebar');
   } catch (e) {}
+  const small = window.innerWidth <= 900;
+  const collapsed = pref ? pref === 'closed' : small;
   document.body.classList.toggle('akori-dark', dark);
   document.body.classList.toggle('dark', dark);
   document.body.classList.toggle('sidebar-collapsed', collapsed);
+  if (!window.__akoriSidebarBound) {
+    window.__akoriSidebarBound = true;
+    document.addEventListener('click', (ev) => {
+      // Écran étroit : après le choix d'une page, le menu se referme pour libérer l'affichage.
+      if (window.innerWidth <= 900 && ev.target.closest('#sidebar .navbtn')) {
+        document.body.classList.add('sidebar-collapsed');
+        try { localStorage.setItem('akori-sidebar', 'closed'); } catch (e) {}
+      }
+    });
+  }
   return dark ? '🌙 Sombre' : '☀️ Clair';
 }
 """
@@ -2023,26 +2103,25 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
     quiz_answers = gr.State([])
 
     with gr.Row(equal_height=False):
-        with gr.Column(scale=1, elem_id="sidebar"):
+        with gr.Column(scale=1, min_width=60, elem_id="sidebar"):
+            menu_btn = gr.Button("☰", elem_id="sidebar-toggle")
             gr.HTML("<div class='brand'><div class='brand-mark'>A</div><div><div class='brand-name'>AKORI</div><div class='brand-sub'>Assistant Knowledge Organized<br>to Revise Intelligently</div></div></div>")
             gr.Markdown("**NAVIGATION**", elem_classes="nav-title")
-            nav_home = gr.Button("⌂  Accueil", elem_classes="navbtn")
-            nav_courses = gr.Button("▣  Mes dossiers", elem_classes="navbtn")
-            nav_review = gr.Button("◈  Réviser", elem_classes="navbtn")
-            nav_flash = gr.Button("▤  Flashcards", elem_classes="navbtn")
-            nav_quiz = gr.Button("☷  Quiz / QCM", elem_classes="navbtn")
-            nav_summary = gr.Button("≡  Résumé", elem_classes="navbtn")
-            nav_assistant = gr.Button("✦  Assistant IA", elem_classes="navbtn")
-            nav_progress = gr.Button("↗  Progression", elem_classes="navbtn")
-            nav_reviewq = gr.Button("!  À revoir", elem_classes="navbtn")
-            nav_history = gr.Button("◷  Historique", elem_classes="navbtn")
-            nav_settings = gr.Button("⚙  Paramètres", elem_classes="navbtn")
-            gr.Markdown("---")
+            nav_home = gr.Button("Accueil", elem_id="nav-home", elem_classes="navbtn")
+            nav_courses = gr.Button("Mes dossiers", elem_id="nav-courses", elem_classes="navbtn")
+            nav_review = gr.Button("Réviser", elem_id="nav-review", elem_classes="navbtn")
+            nav_flash = gr.Button("Flashcards", elem_id="nav-flash", elem_classes="navbtn")
+            nav_quiz = gr.Button("Quiz / QCM", elem_id="nav-quiz", elem_classes="navbtn")
+            nav_summary = gr.Button("Résumé", elem_id="nav-summary", elem_classes="navbtn")
+            nav_assistant = gr.Button("Assistant IA", elem_id="nav-assistant", elem_classes="navbtn")
+            nav_progress = gr.Button("Progression", elem_id="nav-progress", elem_classes="navbtn")
+            nav_reviewq = gr.Button("À revoir", elem_id="nav-reviewq", elem_classes="navbtn")
+            nav_history = gr.Button("Historique", elem_id="nav-history", elem_classes="navbtn")
+            nav_settings = gr.Button("Paramètres", elem_id="nav-settings", elem_classes="navbtn")
             gr.Markdown("<div class='sidebar-note'>Vos documents, historiques et progressions sont conservés localement dans AKORI.</div>")
 
-        with gr.Column(scale=4, elem_id="main-column"):
+        with gr.Column(scale=4, min_width=280, elem_id="main-column"):
             with gr.Row(elem_id="topbar"):
-                menu_btn = gr.Button("☰", elem_id="sidebar-toggle", scale=0, min_width=52)
                 gr.Markdown("### AKORI · Espace de révision")
                 doc_selector = gr.Dropdown(label="Cours actif", choices=list(documents_db.keys()), value=(next(iter(documents_db), None)), scale=2)
 
