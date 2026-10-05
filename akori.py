@@ -1,4 +1,5 @@
 import hashlib
+import html
 import json
 import os
 from datetime import datetime
@@ -716,16 +717,24 @@ def dashboard_html(active_doc=None):
     active_title = active.get("title", "Aucun cours sélectionné")
     cards = "".join(_course_card_html(n, d, n == active_doc) for n, d in documents_db.items())
     if not cards:
-        cards = "<div class='empty-state'>📚 Aucun cours pour le moment.<br><span>Importez votre premier PDF pour commencer une session de révision.</span></div>"
+        cards = "<div class='empty-state'>📚 Aucun cours pour le moment.<br><span>Importez votre premier PDF dans 'Mes dossiers' pour commencer.</span></div>"
+
     return f"""
     <div class='hero'>
       <div>
         <div class='eyebrow'>ASSISTANT KNOWLEDGE ORGANIZED TO REVISE INTELLIGENTLY</div>
         <h1>Bonjour 👋<br><span>Prêt à booster votre révision ?</span></h1>
-        <p class='home-slogan'>Réviser un cours ne consiste pas simplement à rechercher une réponse générale sur internet ou à interroger une IA sur un sujet donné. Réviser, c'est reprendre, comprendre, mémoriser et maîtriser les notions présentées dans un cadre pédagogique déterminé.</p>
-        <p class='home-intro'>AKORI transforme vos notes de cours en un espace de révision ancré dans vos documents : résumé, flashcards, quiz et assistant IA.</p>
+        <p class='home-slogan'>AKORI transforme vos cours PDF en un espace de révision intelligent : résumé, flashcards roulette, quiz et assistant RAG.</p>
       </div>
       <div class='hero-orb'>✦</div>
+    </div>
+    <div class='guide-box'>
+      <h3>💡 Guide de révision AKORI &amp; mode roulette flashcards</h3>
+      <div class='guide-grid'>
+        <div class='guide-item'><b>1. Chargez vos dossiers</b><span>Glissez vos PDF dans <i>Mes dossiers</i> pour activer l'indexation FAISS.</span></div>
+        <div class='guide-item'><b>2. Lancement roulette</b><span>Générez au moins 7 flashcards. Les questions défilent automatiquement en boucle.</span></div>
+        <div class='guide-item'><b>3. Clic &amp; réponse effacée</b><span>Cliquez sur la carte pour <b>stopper/relancer</b>. La réponse s'efface à chaque relance.</span></div>
+      </div>
     </div>
     <div class='stat-row'>
       <div class='mini-stat'><b>{total_docs}</b><span>Cours importés</span></div>
@@ -741,8 +750,6 @@ def dashboard_html(active_doc=None):
     <div class='section-head'><div><h2>Mes cours</h2><p>Vos supports de révision indexés localement.</p></div></div>
     <div class='course-grid'>{cards}</div>
     """
-
-
 
 def course_overview_html(active_doc=None):
     if not active_doc or active_doc not in documents_db:
@@ -848,104 +855,200 @@ def generate_flashcards_v12(doc_name, count=6):
         return [], f"⚠️ Génération impossible : {message}"
 
 
-def _flashcards_state_load(state):
-    """Convertit l'état Gradio en liste simple de dictionnaires JSON-safe."""
-    if not state:
+# ============================================================
+# FLASHCARDS — mode roulette
+# ============================================================
+def normalize_flashcards(cards):
+    if not isinstance(cards, list):
         return []
-    if isinstance(state, str):
-        try:
-            data = json.loads(state)
-            return data if isinstance(data, list) else []
-        except Exception:
-            return []
-    if isinstance(state, list):
-        return [
-            {"question": str(c.get("question", "")), "answer": str(c.get("answer", ""))}
-            for c in state if isinstance(c, dict)
-        ]
-    return []
+    return [
+        {"question": str(c.get("question", "")).strip(), "answer": str(c.get("answer", "")).strip()}
+        for c in cards if isinstance(c, dict) and str(c.get("question", "")).strip()
+    ]
 
 
-def _flashcards_state_dump(cards):
-    """Stocke uniquement des primitives JSON pour éviter les réponses serveur fragiles."""
-    clean = []
-    for card in cards or []:
-        if not isinstance(card, dict):
-            continue
-        q = str(card.get("question", "")).strip()
-        a = str(card.get("answer", "")).strip()
-        if q and a:
-            clean.append({"question": q, "answer": a})
-    return json.dumps(clean, ensure_ascii=False)
+def flashcard_escape(value):
+    return html.escape(str(value or ""), quote=True)
 
 
-def flashcard_view(cards, index=0, revealed=False):
+def save_flashcard_result(doc_name, question, result):
+    """Enregistre le résultat dans la progression réelle du cours."""
+    if not doc_name or doc_name not in documents_db:
+        return
+    _progress_for(doc_name)["flashcards"][question] = "review" if result == "review" else "known"
+    _save_progress(doc_name)
+
+
+def get_flashcard_results(doc_name, cards):
+    if not doc_name or doc_name not in documents_db:
+        return {}
+    marks = _progress_for(doc_name)["flashcards"]
+    return {str(i): marks.get(c["question"]) for i, c in enumerate(cards) if marks.get(c["question"])}
+
+
+def flashcard_statistics(cards, results):
+    total = len(cards)
+    known = sum(1 for i in range(total) if results.get(str(i)) == "known")
+    review = sum(1 for i in range(total) if results.get(str(i)) == "review")
+    return {"total": total, "known": known, "review": review,
+            "mastery": round(known / total * 100) if total else 0}
+
+
+def flashcard_view(cards, index=0, revealed=False, doc_name=None, results=None):
+    cards = normalize_flashcards(cards)
     if not cards:
         return "<div class='empty-study'>🧠<br><b>Aucune flashcard générée.</b><br>Choisissez un cours puis cliquez sur « Générer les flashcards ».</div>"
-    index = max(0, min(int(index), len(cards)-1))
-    card = cards[index]
-    answer = _escape_html(card.get("answer", "")) if revealed else "Cliquez sur « Afficher la réponse » pour vérifier votre mémoire."
-    answer_cls = " answer-visible" if revealed else " answer-hidden"
+
+    try:
+        index = int(index)
+    except Exception:
+        index = 0
+    index = max(0, min(index, len(cards) - 1))
+
+    current = cards[index]
+    question = html.escape(current["question"], quote=False)
+    answer = html.escape(current["answer"], quote=False)
+    total = len(cards)
+    cards_json = json.dumps(cards, ensure_ascii=True).replace("</", "<\\/")
+
+    if revealed:
+        answer_html = f"<div style='margin-top:20px;padding:15px;background:#eef2ff;border-radius:12px;border-left:4px solid #4f46e5;color:#1e293b;'><b>💡 Réponse :</b><br><br>{answer}</div>"
+    else:
+        answer_html = "<div style='margin-top:20px;text-align:center;color:#94a3b8;'>Cliquez sur le bouton <b>« Afficher la réponse »</b>.</div>"
+
+    html_body = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+body {{ font-family:'Segoe UI',system-ui,sans-serif;margin:0;padding:10px;overflow:hidden; }}
+.card {{ cursor:pointer;position:relative;min-height:280px;padding:40px;border-radius:24px;background:#fff;border:1px solid #e2e8f0;box-shadow:0 10px 30px rgba(15,23,42,.07);display:flex;flex-direction:column;justify-content:center;align-items:center;transition:box-shadow .2s; }}
+.card:hover {{ box-shadow:0 15px 40px rgba(15,23,42,.12); }}
+.badge {{ position:absolute;top:20px;left:20px;color:#6366f1;font-size:12px;font-weight:800; }}
+.status {{ position:absolute;top:20px;right:20px;padding:5px 10px;border-radius:20px;background:#fef3c7;color:#b45309;font-size:12px;font-weight:700; }}
+.q-text {{ text-align:center;color:#172033;font-size:24px;font-weight:bold;line-height:1.4;margin:20px 0; }}
+.hint {{ margin-top:20px;color:#94a3b8;font-size:12px;text-align:center; }}
+</style></head><body>
+<div class="card" onclick="toggle()">
+  <div class="badge">🎯 CARTE {index + 1} / {total}</div>
+  <div id="status" class="status">🎰 Roulette active</div>
+  <div id="question" class="q-text">{question}</div>
+  <div style="width:100%;">{answer_html}</div>
+  <div id="hint" class="hint">Cliquez sur la carte pour l'arrêter.</div>
+</div>
+<script>
+const cards = {cards_json};
+const realIndex = {index};
+const isRevealed = {'true' if revealed else 'false'};
+let timer = null;
+let running = !isRevealed;
+const qEl = document.getElementById("question");
+const statusEl = document.getElementById("status");
+const hintEl = document.getElementById("hint");
+function start() {{
+  if (isRevealed || cards.length <= 1) return;
+  running = true;
+  statusEl.innerText = "🎰 Roulette active";
+  statusEl.style.background = "#fef3c7"; statusEl.style.color = "#b45309";
+  hintEl.innerText = "Cliquez sur la carte pour l'arrêter.";
+  timer = setInterval(() => {{ qEl.innerText = cards[Math.floor(Math.random() * cards.length)].question; }}, 120);
+}}
+function stop() {{
+  running = false;
+  if (timer) clearInterval(timer);
+  statusEl.innerText = "⏸ Roulette arrêtée";
+  statusEl.style.background = "#dcfce7"; statusEl.style.color = "#15803d";
+  hintEl.innerText = isRevealed ? "Passez à la carte suivante." : "Cliquez sur le bouton pour afficher la réponse.";
+  qEl.innerText = cards[realIndex].question;
+}}
+window.toggle = function() {{ if (isRevealed) return; running ? stop() : start(); }};
+running ? start() : stop();
+</script></body></html>"""
+    safe_html = html.escape(html_body, quote=True)
+    return f'<iframe srcdoc="{safe_html}" style="width:100%;height:450px;border:none;overflow:hidden;background:transparent;"></iframe>'
+
+
+def flashcard_generate_handler(doc_name):
+    if not doc_name or doc_name not in documents_db:
+        return [], 0, False, flashcard_view([], 0, False), "⚠️ Aucun document sélectionné."
+
+    document = documents_db[doc_name]
+    cards = normalize_flashcards(document.get("flashcards", []))
+
+    if not cards:
+        try:
+            context = "\n\n".join(preparer_contexte_global(document))
+            if not context.strip():
+                return [], 0, False, flashcard_view([], 0, False), "❌ Document vide."
+            prompt = f"""CONTEXTE DU COURS:\n{context}\n\n
+Crée au moins 7 flashcards (questions/réponses) pour réviser les concepts clés de ce cours.
+Retourne UNIQUEMENT un JSON valide avec la structure exacte suivante :
+{{"flashcards": [{{"question": "...", "answer": "..."}}]}}"""
+            raw = _gemini_structured(
+                prompt, "Tu es AKORI, assistant académique. Base-toi uniquement sur le contexte fourni et n'invente rien.")
+            data = _extract_json_from_text(raw)
+            if isinstance(data, dict):
+                cards = data.get("flashcards") or data.get("cards") or []
+            cards = normalize_flashcards(cards)
+            if cards:
+                document["flashcards"] = cards
+        except Exception as e:
+            return [], 0, False, flashcard_view([], 0, False), f"❌ Erreur : {e}"
+
+    if not cards:
+        return [], 0, False, flashcard_view([], 0, False), "❌ Le modèle n'a renvoyé aucune flashcard valide."
+
+    view = flashcard_view(cards, 0, False, doc_name, get_flashcard_results(doc_name, cards))
+    return cards, 0, False, view, f"✅ {len(cards)} flashcards prêtes !"
+
+
+def flashcard_reveal_handler(cards, index, doc_name):
+    cards = normalize_flashcards(cards)
+    return True, flashcard_view(cards, index, True, doc_name, get_flashcard_results(doc_name, cards))
+
+
+def flashcard_end_game_view(doc_name, total, known_count, review_count):
+    mastery = round(known_count / total * 100) if total else 0
+    doc_safe = flashcard_escape(doc_name or "Cours actuel")
     return f"""
-    <div class='study-progress'>Carte {index+1} / {len(cards)} <span></span></div>
-    <div class='flashcard'>
-      <div class='card-label'>CONCEPT À RAPPELER</div>
-      <h2>{_escape_html(card.get('question',''))}</h2>
-      <div class='card-answer{answer_cls}'>{answer}</div>
+    <div class='quiz-result'>
+      <div style="font-size:48px;margin-bottom:12px;">🎉</div>
+      <div class='quiz-result-kicker'>SESSION TERMINÉE</div>
+      <p>{doc_safe}</p>
+      <div class='quiz-stats'>
+        <div><b>{mastery}%</b><span>Maîtrise</span></div>
+        <div><b>{known_count}</b><span>Maîtrisées</span></div>
+        <div><b>{review_count}</b><span>À revoir</span></div>
+      </div>
     </div>
     """
 
 
-def flashcard_generate_handler(doc_name):
-    try:
-        cards, status = generate_flashcards_v12(doc_name)
-        state = _flashcards_state_dump(cards)
-        # Normalise le statut : une génération réussie ne doit jamais laisser l'ancien message d'erreur.
-        if cards:
-            status = f"✅ {len(cards)} flashcards générées à partir du cours actif."
-        return state, 0, False, flashcard_view(cards, 0, False), status
-    except Exception as e:
-        return "[]", 0, False, flashcard_view([], 0, False), f"⚠️ Génération impossible : {e}"
-
-
-def flashcard_reveal_handler(state, index, revealed):
-    cards = _flashcards_state_load(state)
-    revealed = not bool(revealed)
-    return revealed, flashcard_view(cards, index, revealed)
-
-
-def flashcard_move_handler(state, index, direction):
-    cards = _flashcards_state_load(state)
+def flashcard_mark_handler(cards, index, mark_type, doc_name):
+    cards = normalize_flashcards(cards)
     if not cards:
         return 0, False, flashcard_view([], 0, False)
-    new_index = (int(index) + int(direction)) % len(cards)
-    return new_index, False, flashcard_view(cards, new_index, False)
+    index = int(index)
+    if index < len(cards):
+        save_flashcard_result(doc_name, cards[index]["question"], mark_type)
+    next_index = index + 1
+    results = get_flashcard_results(doc_name, cards)
+    if next_index >= len(cards):
+        st = flashcard_statistics(cards, results)
+        return next_index, False, flashcard_end_game_view(doc_name, st["total"], st["known"], st["review"])
+    return next_index, False, flashcard_view(cards, next_index, False, doc_name, results)
 
 
-def flashcard_mark_handler(state, index, status, doc_name):
-    cards = _flashcards_state_load(state)
-    if not cards:
-        return "Aucune carte active.", progress_detail_html(doc_name)
-    idx = int(index)
-    if 0 <= idx < len(cards) and doc_name in documents_db:
-        question = cards[idx].get("question", "")
-        _progress_for(doc_name)["flashcards"][question] = "review" if status == "review" else "known"
-        _save_progress(doc_name)
-    label = "À revoir" if status == "review" else "Maîtrisée"
-    return f"✓ Carte {idx+1} marquée : {label}.", progress_detail_html(doc_name)
-
-
+# ============================================================
+# QUIZ — une question à la fois, réponses cliquables
+# ============================================================
 def generate_quiz_v12(doc_name, count=5):
     if not doc_name or doc_name not in documents_db:
         return [], "⚠️ Sélectionnez d'abord un cours."
     context = "\n\n".join(preparer_contexte_global(documents_db[doc_name]))
-    prompt = f"""CONTEXTE DU COURS:\n{context}\n\nCrée exactement {count} questions QCM de révision. Une seule bonne réponse par question.\nRetourne uniquement un JSON valide: {{\"questions\":[{{\"question\":\"...\",\"options\":[\"...\",\"...\",\"...\",\"...\"],\"answer\":0,\"explanation\":\"...\"}}]}}\nanswer est l'index 0-3 de la bonne option."""
+    prompt = f"""CONTEXTE DU COURS:\n{context}\n\nCrée exactement {count} questions QCM de révision. Une seule bonne réponse par question.\nRetourne uniquement un JSON valide: {{\"questions\":[{{\"question\":\"...\",\"options\":[\"...\",\"...\",\"...\",\"...\"],\"answer\":0,\"explanation\":\"...\",\"topic\":\"notion abordée (2-3 mots)\"}}]}}\nanswer est l'index 0-3 de la bonne option."""
     try:
         data = _extract_json_from_text(_gemini_structured(prompt, "Tu es AKORI, assistant académique. Base-toi uniquement sur le contexte fourni et n'invente rien."))
         questions = data.get("questions", []) if isinstance(data, dict) else []
         valid = []
         for q in questions:
-            if q.get("question") and isinstance(q.get("options"), list) and len(q["options"]) == 4 and q.get("answer") in [0,1,2,3]:
+            if isinstance(q, dict) and q.get("question") and isinstance(q.get("options"), list) and len(q["options"]) == 4 and q.get("answer") in [0, 1, 2, 3]:
                 q["topic"] = str(q.get("topic") or "Général").strip() or "Général"
                 valid.append(q)
         valid = valid[:count]
@@ -956,85 +1059,136 @@ def generate_quiz_v12(doc_name, count=5):
         return [], f"⚠️ {e}"
 
 
-def quiz_view(questions, index=0, selected=None, validated=False):
+NEXT_LABEL = "Question suivante →"
+FINISH_LABEL = "Voir le résultat 🎯"
+
+
+def _quiz_score(questions, answers):
+    answers = answers or []
+    return sum(
+        1 for i, q in enumerate(questions)
+        if i < len(answers) and answers[i] is not None and int(answers[i]) == int(q["answer"])
+    )
+
+
+def _quiz_radio(questions, index, visible=True):
+    """Radio dont les choix sont les vrais textes des réponses."""
+    if not questions or index >= len(questions):
+        return gr.update(choices=[], value=None, visible=False)
+    options = questions[index]["options"]
+    return gr.update(
+        choices=[(f"{chr(65 + i)}.  {opt}", i) for i, opt in enumerate(options)],
+        value=None, visible=visible, interactive=True, label="Choisissez votre réponse",
+    )
+
+
+def quiz_view(questions, index=0, validated=False, answers=None):
     if not questions:
         return "<div class='empty-study'>📝<br><b>Aucun quiz généré.</b><br>Choisissez un cours puis cliquez sur « Générer le quiz ».</div>"
-    index = max(0, min(int(index), len(questions)-1))
+    total = len(questions)
+    index = max(0, min(int(index), total - 1))
     q = questions[index]
-    rows = ""
-    for i, option in enumerate(q["options"]):
-        cls = " option selected" if selected == i else " option"
-        if validated and i == q["answer"]:
-            cls += " correct"
-        elif validated and selected == i and selected != q["answer"]:
-            cls += " wrong"
-        rows += f"<div class='{cls}'><span>{chr(65+i)}</span>{_escape_html(option)}</div>"
-    explanation = ""
+    answers = answers or []
+    selected = answers[index] if index < len(answers) else None
+    score = _quiz_score(questions, answers)
+    done = index + (1 if validated else 0)
+    pct = round(done / total * 100)
+
+    body = ""
     if validated:
-        explanation = f"<div class='quiz-explanation'><b>Explication :</b> {_escape_html(q.get('explanation',''))}</div>"
+        rows = ""
+        for i, option in enumerate(q["options"]):
+            cls = "option"
+            if i == int(q["answer"]):
+                cls += " correct"
+            elif selected == i:
+                cls += " wrong"
+            mark = "✓" if i == int(q["answer"]) else ("✗" if selected == i else chr(65 + i))
+            rows += f"<div class='{cls}'><span>{mark}</span>{_escape_html(option)}</div>"
+        ok = selected is not None and int(selected) == int(q["answer"])
+        verdict = "<div class='quiz-verdict ok'>✅ Bonne réponse !</div>" if ok else "<div class='quiz-verdict ko'>❌ Réponse incorrecte</div>"
+        body = f"{verdict}{rows}<div class='quiz-explanation'><b>Explication :</b> {_escape_html(q.get('explanation', ''))}</div>"
+
     return f"""
-    <div class='study-progress'>Question {index+1} / {len(questions)}</div>
-    <div class='quiz-card'><div class='card-label'>QUIZ / QCM</div><h2>{_escape_html(q['question'])}</h2>{rows}{explanation}</div>
+    <div class='quiz-topline'><span>Question {index + 1} / {total}</span><span>Score : {score}</span></div>
+    <div class='quiz-bar'><div style='width:{pct}%;'></div></div>
+    <div class='quiz-card'><div class='card-label'>QUIZ / QCM · {_escape_html(q.get('topic', 'Général'))}</div><h2>{_escape_html(q['question'])}</h2>{body}</div>
     """
 
 
 def quiz_generate_handler(doc_name):
     qs, status = generate_quiz_v12(doc_name)
-    return qs, 0, None, False, quiz_view(qs, 0, None, False), status
+    return (qs, 0, False, quiz_view(qs, 0, False, []), status,
+            _quiz_radio(qs, 0), [None] * len(qs), gr.update(value=NEXT_LABEL))
 
 
-def quiz_select_handler(choice, questions, index):
-    selected = int(choice) if choice is not None else None
-    return selected, False, quiz_view(questions, index, selected, False)
+def quiz_restart_handler(questions):
+    questions = questions or []
+    return (questions, 0, False, quiz_view(questions, 0, False, []), "🔁 Quiz relancé.",
+            _quiz_radio(questions, 0), [None] * len(questions), gr.update(value=NEXT_LABEL))
 
 
-def quiz_validate_handler(questions, index, selected, answers, doc_name):
-    if not questions or selected is None:
-        return True, quiz_view(questions, index, selected, True), "⚠️ Sélectionnez une réponse avant de valider.", answers, progress_detail_html(doc_name)
+def quiz_validate_handler(questions, index, choice, validated, answers):
+    if not questions or int(index) >= len(questions):
+        return validated, gr.update(), "⚠️ Générez d'abord un quiz.", answers, gr.update(), gr.update()
+    if validated:
+        return validated, gr.update(), "ℹ️ Réponse déjà validée : passez à la suite.", answers, gr.update(), gr.update()
+    if choice is None:
+        return False, gr.update(), "⚠️ Sélectionnez une réponse avant de valider.", answers, gr.update(), gr.update()
     idx = int(index)
-    q = questions[idx]
-    ok = int(selected) == int(q["answer"])
     answers = list(answers or [None] * len(questions))
-    if len(answers) < len(questions):
-        answers.extend([None] * (len(questions) - len(answers)))
-    answers[idx] = int(selected)
+    answers.extend([None] * (len(questions) - len(answers)))
+    answers[idx] = int(choice)
+    ok = int(choice) == int(questions[idx]["answer"])
     status = "✅ Bonne réponse." if ok else "❌ Réponse incorrecte. Consultez l'explication."
-    return True, quiz_view(questions, index, selected, True), status, answers, progress_detail_html(doc_name)
+    last = idx == len(questions) - 1
+    return (True, quiz_view(questions, idx, True, answers), status, answers,
+            gr.update(visible=False), gr.update(value=FINISH_LABEL if last else NEXT_LABEL))
 
 
 def quiz_result_view(questions, answers):
     total = len(questions)
-    score = sum(1 for i,q in enumerate(questions) if i < len(answers) and answers[i] is not None and int(answers[i]) == int(q["answer"]))
+    score = _quiz_score(questions, answers)
     pct = round(score / total * 100) if total else 0
+    wrong = ""
+    for i, q in enumerate(questions):
+        a = answers[i] if i < len(answers) else None
+        if a is None or int(a) != int(q["answer"]):
+            wrong += (f"<div class='quiz-miss'><b>{_escape_html(q['question'])}</b>"
+                      f"<span>Bonne réponse : {_escape_html(q['options'][int(q['answer'])])}</span></div>")
+    review = f"<div class='quiz-miss-list'><div class='global-list-title'>À revoir</div>{wrong}</div>" if wrong else "<p>🏆 Sans faute, bravo !</p>"
     return f"""
     <div class='quiz-result'>
       <div class='quiz-result-kicker'>QUIZ TERMINÉ</div>
       <div class='quiz-score'>{score} / {total}</div>
       <div class='quiz-score-percent'>{pct}% de bonnes réponses</div>
-      <p>Votre résultat a été enregistré automatiquement dans la progression de ce cours.</p>
-    </div>
+      <p>Votre résultat a été enregistré dans la progression de ce cours.</p>
+    </div>{review}
     """
 
 
 def quiz_next_handler(questions, index, validated, answers, doc_name):
-    if not questions:
-        return 0, None, False, answers or [], quiz_view([], 0), "", progress_detail_html(doc_name)
+    if not questions or int(index) >= len(questions):
+        return index, validated, gr.update(), gr.update(), gr.update(), gr.update()
+    index = int(index)
     if not validated:
-        return index, None, False, answers or [], quiz_view(questions, index, answers[int(index)] if int(index) < len(answers) else None, False), "⚠️ Validez d'abord cette réponse.", progress_detail_html(doc_name)
-    if int(index) < len(questions) - 1:
-        new_index = int(index) + 1
-        return new_index, None, False, answers, quiz_view(questions, new_index), "", progress_detail_html(doc_name)
-
-    total = len(questions)
+        return index, False, gr.update(), "⚠️ Validez d'abord cette réponse.", gr.update(), gr.update()
+    if index < len(questions) - 1:
+        new_index = index + 1
+        return (new_index, False, quiz_view(questions, new_index, False, answers), "",
+                _quiz_radio(questions, new_index), gr.update(value=NEXT_LABEL))
     answers = list(answers or [])
-    score = sum(1 for i,q in enumerate(questions) if i < len(answers) and answers[i] is not None and int(answers[i]) == int(q["answer"]))
+    score = _quiz_score(questions, answers)
     items = []
-    for i,q in enumerate(questions):
-        answer = answers[i] if i < len(answers) else None
-        items.append({"topic": q.get("topic", "Général"), "correct": answer is not None and int(answer) == int(q["answer"])})
-    _progress_for(doc_name)["quiz_attempts"].append({"score": score, "total": total, "items": items, "timestamp": datetime.now().isoformat(timespec="seconds")})
+    for i, q in enumerate(questions):
+        a = answers[i] if i < len(answers) else None
+        items.append({"topic": q.get("topic", "Général"), "correct": a is not None and int(a) == int(q["answer"])})
+    _progress_for(doc_name)["quiz_attempts"].append(
+        {"score": score, "total": len(questions), "items": items, "timestamp": datetime.now().isoformat(timespec="seconds")})
     _save_progress(doc_name)
-    return int(index), None, True, answers, quiz_result_view(questions, answers), f"🎯 Quiz terminé : {score}/{total}.", progress_detail_html(doc_name)
+    # index = len(questions) marque le quiz comme terminé (pas de double enregistrement).
+    return (len(questions), True, quiz_result_view(questions, answers), f"🎯 Quiz terminé : {score}/{len(questions)}.",
+            gr.update(choices=[], value=None, visible=False), gr.update(value=NEXT_LABEL))
 
 
 def history_view(doc_name):
@@ -1594,6 +1748,168 @@ html, body, .gradio-container,
   .stat-row,.course-grid,.folder-grid{grid-template-columns:1fr}
   .hero h1{font-size:27px}
 }
+
+/* ===== Accueil : guide ===== */
+.guide-box { background:#fff;border:1px solid #dfe5ef;border-radius:18px;padding:22px;margin:20px 0;box-shadow:0 4px 16px rgba(42,55,90,.03); }
+.guide-box h3 { margin:0 0 12px;font-size:16px;font-weight:800; }
+.guide-grid { display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px;font-size:13px; }
+.guide-item { background:#f8fafc;padding:14px;border-radius:12px;border:1px solid #e2e8f0; }
+.guide-item b { color:#4f6df5!important;font-size:14px;display:block;margin-bottom:4px; }
+.guide-item span { color:#64748b; }
+
+/* ===== Quiz pratique ===== */
+.quiz-topline { display:flex;justify-content:space-between;color:#758096;font-size:12px;font-weight:650;margin-bottom:8px; }
+.quiz-bar { height:7px;background:#e9edf5;border-radius:999px;overflow:hidden;margin-bottom:14px; }
+.quiz-bar div { height:100%;background:linear-gradient(90deg,#566ff0,#7b7df1);border-radius:999px;transition:width .3s ease; }
+.quiz-card { min-height:0!important;padding:26px!important; }
+.quiz-card h2 { margin:14px 0 18px!important;font-size:21px!important; }
+.quiz-verdict { font-weight:800;margin-bottom:10px;font-size:15px; }
+.quiz-verdict.ok { color:#168451; } .quiz-verdict.ko { color:#d95b67; }
+.quiz-stats { display:flex;justify-content:center;gap:14px;flex-wrap:wrap;margin-top:14px; }
+.quiz-stats>div { background:#eef2ff;border-radius:14px;padding:14px 22px;min-width:110px; }
+.quiz-stats b { display:block;font-size:26px;color:#4f46e5; } .quiz-stats span { font-size:12px;color:#778298; }
+.quiz-miss-list { background:#fff;border:1px solid var(--ak-line);border-radius:16px;padding:16px;margin-top:12px; }
+.quiz-miss { padding:10px 0;border-bottom:1px solid #edf0f5; } .quiz-miss:last-child { border:0; }
+.quiz-miss b { display:block;color:#26324b;font-size:13px; } .quiz-miss span { color:#168451;font-size:12px; }
+
+/* Radio du quiz : grosses cartes cliquables */
+.quiz-radio-group { background:transparent!important;border:0!important;padding:0!important; }
+.quiz-radio-group .wrap { display:flex!important;flex-direction:column!important;gap:10px!important;background:transparent!important;border:0!important; }
+.quiz-radio-group label.svelte-1mhtq7j, .quiz-radio-group .wrap > label {
+  background:#fff!important;border:1.5px solid #e2e8f0!important;border-radius:14px!important;
+  padding:14px 18px!important;cursor:pointer!important;transition:all .15s ease!important;
+  font-size:14px!important;display:flex!important;align-items:center!important;
+}
+.quiz-radio-group .wrap > label:hover { border-color:#4f46e5!important;background:#eef2ff!important;transform:translateY(-1px); }
+.quiz-radio-group .wrap > label.selected, .quiz-radio-group .wrap > label:has(input:checked) { border-color:#4f46e5!important;background:#eef2ff!important;box-shadow:0 0 0 2px #dfe5ff; }
+.quiz-radio-group input[type="radio"] { accent-color:#4f46e5!important;margin-right:12px!important; }
+
+/* ===== Bouton de thème ===== */
+#theme-toggle { max-width:150px!important;min-width:130px!important; }
+
+/* ===== THÈME SOMBRE ===== */
+html:has(body.akori-dark), body.akori-dark { background:#0e1422!important; }
+body.akori-dark {
+  --ak-bg:#0e1422; --ak-card:#161e30; --ak-text:#e6ebf7; --ak-muted:#9aa6bf;
+  --ak-soft:#1c2540; --ak-line:#27324a; --ak-blue-dark:#8ea2ff;
+}
+body.akori-dark, body.akori-dark .gradio-container { background:#0e1422!important;color:#e6ebf7!important; }
+body.akori-dark .gradio-container p, body.akori-dark .gradio-container span:not(.katex *) { color:#a3aec6; }
+body.akori-dark .gradio-container h1, body.akori-dark .gradio-container h2,
+body.akori-dark .gradio-container h3, body.akori-dark .gradio-container h4,
+body.akori-dark .gradio-container strong, body.akori-dark .gradio-container label,
+body.akori-dark .gr-markdown, body.akori-dark .prose { color:#e6ebf7!important; }
+
+/* surfaces */
+body.akori-dark #sidebar, body.akori-dark #sidebar .block, body.akori-dark #sidebar .form, body.akori-dark #sidebar .gr-column,
+body.akori-dark #topbar, body.akori-dark .mini-stat, body.akori-dark .revision-banner, body.akori-dark .course-card,
+body.akori-dark .folder-card, body.akori-dark .flashcard, body.akori-dark .quiz-card, body.akori-dark .global-metrics>div,
+body.akori-dark .global-course-list, body.akori-dark .progress-hero, body.akori-dark .progress-metrics>div,
+body.akori-dark .progress-box, body.akori-dark .course-overview, body.akori-dark .quiz-result,
+body.akori-dark .quiz-miss-list, body.akori-dark .history-ai, body.akori-dark .guide-box,
+body.akori-dark .empty-state, body.akori-dark .empty-study, body.akori-dark .progress-list,
+body.akori-dark .progress-panel {
+  background:#161e30!important;border-color:#27324a!important;
+}
+body.akori-dark .hero { background:linear-gradient(120deg,#16203a 0%,#1b1838 100%)!important;border-color:#2a3558!important; }
+body.akori-dark .global-progress-hero { background:linear-gradient(135deg,#161e30,#1a2036)!important;border-color:#27324a!important; }
+body.akori-dark .guide-item, body.akori-dark .global-detail-hint, body.akori-dark .progress-note,
+body.akori-dark .progress-empty, body.akori-dark .quiz-explanation, body.akori-dark .answer-hidden,
+body.akori-dark .global-course-row.active-progress-course { background:#1b2438!important;border-color:#27324a!important; }
+body.akori-dark .history-user, body.akori-dark .revision-chip, body.akori-dark .quiz-stats>div { background:#1c2540!important; }
+body.akori-dark .global-progress-ring:before, body.akori-dark .progress-ring:before { background:#161e30!important; }
+body.akori-dark .global-progress-ring, body.akori-dark .progress-ring { background:conic-gradient(#7b8ff7 var(--progress,0%),#27324a 0)!important; }
+body.akori-dark .global-course-bar, body.akori-dark .quiz-bar { background:#27324a!important; }
+body.akori-dark .global-course-row, body.akori-dark .strength-row, body.akori-dark .weakness-row,
+body.akori-dark .quiz-miss, body.akori-dark .progress-list div { border-color:#27324a!important; }
+
+/* textes principaux */
+body.akori-dark .mini-stat b, body.akori-dark .global-metrics b, body.akori-dark .progress-metrics b,
+body.akori-dark .section-head h2, body.akori-dark .hero h1, body.akori-dark .revision-banner strong,
+body.akori-dark .folder-card-name, body.akori-dark .course-title, body.akori-dark .course-overview-title,
+body.akori-dark .progress-title, body.akori-dark .global-course-main b, body.akori-dark .global-list-title,
+body.akori-dark .progress-box h3, body.akori-dark .quiz-score, body.akori-dark .global-progress-copy h2,
+body.akori-dark .global-progress-ring span, body.akori-dark .progress-ring span, body.akori-dark .strength-row,
+body.akori-dark .weakness-row, body.akori-dark .history-user, body.akori-dark .history-ai,
+body.akori-dark .option, body.akori-dark .flashcard h2, body.akori-dark .quiz-card h2,
+body.akori-dark .quiz-miss b, body.akori-dark #sidebar .brand-name { color:#e6ebf7!important; }
+body.akori-dark .hero h1 span { color:#8ea2ff!important; }
+body.akori-dark .hero p, body.akori-dark .home-slogan, body.akori-dark .mini-stat span, body.akori-dark .global-metrics span,
+body.akori-dark .progress-metrics span, body.akori-dark .section-head p, body.akori-dark .revision-banner span,
+body.akori-dark .folder-card-size, body.akori-dark .folder-card-date, body.akori-dark .course-overview-file,
+body.akori-dark .course-overview-meta, body.akori-dark .global-course-main small, body.akori-dark .progress-sub,
+body.akori-dark .quiz-topline, body.akori-dark .quiz-result p, body.akori-dark .guide-item span,
+body.akori-dark #sidebar .brand-sub, body.akori-dark #sidebar .sidebar-note { color:#9aa6bf!important; }
+body.akori-dark .eyebrow, body.akori-dark .card-label, body.akori-dark .quiz-result-kicker { color:#8ea2ff!important; }
+
+/* boutons de navigation */
+body.akori-dark #sidebar .navbtn, body.akori-dark #sidebar .navbtn.gr-button, body.akori-dark #sidebar button,
+body.akori-dark #sidebar .gr-button { background:#161e30!important;color:#c9d2e6!important;-webkit-text-fill-color:#c9d2e6!important; }
+body.akori-dark #sidebar .navbtn *, body.akori-dark #sidebar button * { color:#c9d2e6!important;-webkit-text-fill-color:#c9d2e6!important; }
+body.akori-dark #sidebar .navbtn:hover, body.akori-dark #sidebar button:hover,
+body.akori-dark #sidebar .navbtn:focus { background:#1f2a45!important;color:#a8b8ff!important;-webkit-text-fill-color:#a8b8ff!important;border-color:#2f3d66!important; }
+body.akori-dark .gradio-container .gr-button:not(.primary), body.akori-dark .gradio-container button:not(.primary):not(.navbtn) {
+  background:#1b2438!important;color:#d5dcf0!important;-webkit-text-fill-color:#d5dcf0!important;border-color:#2c3957!important; }
+body.akori-dark #sidebar .primary, body.akori-dark #sidebar button.primary { background:linear-gradient(135deg,#4f6df5,#707cf0)!important;color:#fff!important;-webkit-text-fill-color:#fff!important; }
+
+/* champs */
+body.akori-dark .gradio-container input, body.akori-dark .gradio-container textarea, body.akori-dark .gradio-container select,
+body.akori-dark #assistant-input textarea, body.akori-dark #assistant-input input,
+body.akori-dark #topbar .gr-dropdown, body.akori-dark #topbar .gr-dropdown .wrap, body.akori-dark #topbar .gr-dropdown input {
+  background:#1b2438!important;color:#e6ebf7!important;border-color:#2c3957!important; }
+body.akori-dark .gradio-container .wrap, body.akori-dark .gradio-container .input-container { background:#1b2438!important;border-color:#2c3957!important; }
+body.akori-dark #topbar label, body.akori-dark #topbar .prose, body.akori-dark #topbar h3 { color:#c9d2e6!important; }
+
+/* chat */
+body.akori-dark #assistant-chatbot, body.akori-dark #assistant-chatbot > div, body.akori-dark #assistant-chatbot .wrap,
+body.akori-dark #assistant-chatbot [data-testid="chatbot"] { background:#161e30!important;border-color:#27324a!important; }
+body.akori-dark #assistant-chatbot [data-testid="bot"], body.akori-dark #assistant-chatbot .message.bot { background:#1b2438!important;border-color:#2c3957!important; }
+body.akori-dark #assistant-chatbot [data-testid="user"], body.akori-dark #assistant-chatbot .message.user { background:#232f55!important;border-color:#33427a!important; }
+body.akori-dark #assistant-chatbot .message, body.akori-dark #assistant-chatbot .prose, body.akori-dark #assistant-chatbot .prose *,
+body.akori-dark #assistant-chatbot p, body.akori-dark #assistant-chatbot li, body.akori-dark #assistant-chatbot span,
+body.akori-dark #assistant-chatbot div { color:#dbe2f3!important;-webkit-text-fill-color:#dbe2f3!important; }
+body.akori-dark #assistant-chatbot code, body.akori-dark #assistant-chatbot pre { background:#0f1626!important;color:#dbe2f3!important;border-color:#27324a!important; }
+body.akori-dark .katex, body.akori-dark .katex * { color:#e6ebf7!important; }
+
+/* quiz */
+body.akori-dark .option { border-color:#2c3957!important;background:#1b2438!important; }
+body.akori-dark .option span { background:#27324a!important;color:#c9d2e6!important; }
+body.akori-dark .option.correct { border-color:#2fa77a!important;background:#12352b!important; }
+body.akori-dark .option.wrong { border-color:#d9687a!important;background:#3a1b25!important; }
+body.akori-dark .quiz-radio-group .wrap > label { background:#1b2438!important;border-color:#2c3957!important;color:#e6ebf7!important; }
+body.akori-dark .quiz-radio-group .wrap > label span { color:#e6ebf7!important; }
+body.akori-dark .quiz-radio-group .wrap > label:hover,
+body.akori-dark .quiz-radio-group .wrap > label:has(input:checked) { background:#232f55!important;border-color:#7b8ff7!important;box-shadow:0 0 0 2px #2a3866; }
+body.akori-dark .quiz-stats b { color:#a8b8ff!important; }
+
+/* dossiers / import */
+body.akori-dark .folder-card:hover { border-color:#3b4b7a!important; }
+body.akori-dark .folder-card.active-course { border-color:#7b8ff7!important;box-shadow:0 0 0 2px #1f2a4d; }
+body.akori-dark #add-document-tile .wrap { background:transparent!important; }
+
+/* cartes flashcards (iframe) : inversion douce */
+body.akori-dark iframe { filter:invert(.92) hue-rotate(180deg); }
+"""
+
+
+THEME_TOGGLE_JS = r"""
+() => {
+  const dark = !document.body.classList.contains('akori-dark');
+  document.body.classList.toggle('akori-dark', dark);
+  document.body.classList.toggle('dark', dark);
+  try { localStorage.setItem('akori-theme', dark ? 'dark' : 'light'); } catch (e) {}
+  return dark ? '☀️ Thème clair' : '🌙 Thème sombre';
+}
+"""
+
+THEME_INIT_JS = r"""
+() => {
+  let dark = false;
+  try { dark = localStorage.getItem('akori-theme') === 'dark'; } catch (e) {}
+  document.body.classList.toggle('akori-dark', dark);
+  document.body.classList.toggle('dark', dark);
+  return dark ? '☀️ Thème clair' : '🌙 Thème sombre';
+}
 """
 
 # Petit script client : la navigation reste dans la même page Gradio et
@@ -1621,12 +1937,11 @@ AKORI_NAV_JS = r"""
 theme_akori = gr.themes.Soft(primary_hue="indigo", secondary_hue="purple", neutral_hue="slate")
 
 with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
-    flashcards_state = gr.State("[]")
+    flashcards_state = gr.State([])
     flash_index = gr.State(0)
     flash_revealed = gr.State(False)
     quiz_state = gr.State([])
     quiz_index = gr.State(0)
-    quiz_selected = gr.State(None)
     quiz_validated = gr.State(False)
     quiz_answers = gr.State([])
 
@@ -1651,6 +1966,7 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
             with gr.Row(elem_id="topbar"):
                 gr.Markdown("### AKORI · Espace de révision")
                 doc_selector = gr.Dropdown(label="Cours actif", choices=list(documents_db.keys()), value=(next(iter(documents_db), None)), scale=2)
+                theme_btn = gr.Button("🌙 Thème sombre", elem_id="theme-toggle", scale=0)
 
             with gr.Tabs(elem_id="main-tabs") as tabs:
                 with gr.Tab("Accueil", id="home") as tab_home:
@@ -1685,32 +2001,32 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
                         review_chat = gr.Button("Assistant IA", variant="secondary")
 
                 with gr.Tab("Flashcards", id="flashcards"):
-                    gr.Markdown("## Flashcards")
-                    gr.Markdown("Apprenez activement : essayez de répondre avant d'afficher la réponse.")
+                    gr.Markdown("## Flashcards — Mode Roulette")
                     with gr.Row():
                         generate_flash = gr.Button("✦ Générer les flashcards", variant="primary")
                         flash_status = gr.Markdown("", elem_id="flash-status")
                     flash_view = gr.HTML(flashcard_view([], 0, False))
                     with gr.Row():
-                        flash_prev = gr.Button("← Précédente")
                         flash_reveal = gr.Button("Afficher la réponse", variant="primary")
-                        flash_next = gr.Button("Suivante →")
                     with gr.Row():
-                        flash_known = gr.Button("✓ Je savais")
+                        flash_known = gr.Button("✓ Je savais", variant="primary")
                         flash_review = gr.Button("↻ À revoir")
-                    flash_mark = gr.Markdown("")
 
                 with gr.Tab("Quiz / QCM", id="quiz"):
-                    gr.Markdown("## Quiz / QCM")
-                    gr.Markdown("Testez vos connaissances avec une question à la fois et une explication après validation.")
+                    gr.Markdown("## Quiz d'évaluation")
+                    gr.Markdown("Cliquez sur une réponse, validez, puis passez à la question suivante.")
                     with gr.Row():
                         generate_quiz_btn = gr.Button("✦ Générer le quiz", variant="primary")
+                        quiz_restart = gr.Button("🔁 Rejouer")
                         quiz_status = gr.Markdown("")
                     quiz_view_box = gr.HTML(quiz_view([], 0))
-                    quiz_choice = gr.Radio(choices=[("A", 0), ("B", 1), ("C", 2), ("D", 3)], label="Votre réponse", interactive=True)
+                    quiz_choice = gr.Radio(
+                        choices=[], label="Choisissez votre réponse", container=False,
+                        interactive=True, visible=False, elem_classes="quiz-radio-group",
+                    )
                     with gr.Row():
-                        quiz_validate = gr.Button("Valider", variant="primary")
-                        quiz_next = gr.Button("Question suivante →")
+                        quiz_validate = gr.Button("Valider la réponse", variant="primary", elem_id="quiz_validate")
+                        quiz_next = gr.Button(NEXT_LABEL, elem_id="quiz_next")
 
                 with gr.Tab("Résumé", id="summary"):
                     gr.Markdown("## Résumé du cours")
@@ -1831,8 +2147,7 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
 
     # Flashcards
     generate_flash.click(
-        lambda: "⏳ Génération des flashcards…",
-        outputs=[flash_status], queue=False,
+        lambda: "⏳ Génération des flashcards…", outputs=[flash_status], queue=False,
     ).then(
         flashcard_generate_handler,
         inputs=[doc_selector],
@@ -1842,42 +2157,45 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
     )
     flash_reveal.click(
         flashcard_reveal_handler,
-        inputs=[flashcards_state, flash_index, flash_revealed],
+        inputs=[flashcards_state, flash_index, doc_selector],
         outputs=[flash_revealed, flash_view],
-        queue=False,
-    )
-    flash_prev.click(
-        lambda c, i: flashcard_move_handler(c, i, -1),
-        inputs=[flashcards_state, flash_index],
-        outputs=[flash_index, flash_revealed, flash_view],
-        queue=False,
-    )
-    flash_next.click(
-        lambda c, i: flashcard_move_handler(c, i, 1),
-        inputs=[flashcards_state, flash_index],
-        outputs=[flash_index, flash_revealed, flash_view],
         queue=False,
     )
     flash_known.click(
         lambda c, i, d: flashcard_mark_handler(c, i, "known", d),
         inputs=[flashcards_state, flash_index, doc_selector],
-        outputs=[flash_mark, progress_output],
+        outputs=[flash_index, flash_revealed, flash_view],
         queue=False,
-    )
+    ).then(lambda d: (global_progress_html(d), progress_detail_html(d)), inputs=[doc_selector], outputs=[global_progress_output, progress_output], queue=False)
     flash_review.click(
         lambda c, i, d: flashcard_mark_handler(c, i, "review", d),
         inputs=[flashcards_state, flash_index, doc_selector],
-        outputs=[flash_mark, progress_output],
+        outputs=[flash_index, flash_revealed, flash_view],
         queue=False,
-    )
+    ).then(lambda d: (global_progress_html(d), progress_detail_html(d)), inputs=[doc_selector], outputs=[global_progress_output, progress_output], queue=False)
 
     # Quiz
+    quiz_outputs = [quiz_state, quiz_index, quiz_validated, quiz_view_box, quiz_status, quiz_choice, quiz_answers, quiz_next]
     generate_quiz_btn.click(
         lambda: "⏳ Génération du quiz…", outputs=[quiz_status], queue=False
-    ).then(quiz_generate_handler, inputs=[doc_selector], outputs=[quiz_state, quiz_index, quiz_selected, quiz_validated, quiz_view_box, quiz_status]).then(lambda q: [None] * len(q), inputs=[quiz_state], outputs=[quiz_answers])
-    quiz_choice.change(quiz_select_handler, inputs=[quiz_choice, quiz_state, quiz_index], outputs=[quiz_selected, quiz_validated, quiz_view_box], queue=False)
-    quiz_validate.click(quiz_validate_handler, inputs=[quiz_state, quiz_index, quiz_selected, quiz_answers, doc_selector], outputs=[quiz_validated, quiz_view_box, quiz_status, quiz_answers, progress_output]).then(lambda d: (global_progress_html(d), progress_detail_html(d)), inputs=[doc_selector], outputs=[global_progress_output, progress_output])
-    quiz_next.click(quiz_next_handler, inputs=[quiz_state, quiz_index, quiz_validated, quiz_answers, doc_selector], outputs=[quiz_index, quiz_selected, quiz_validated, quiz_answers, quiz_view_box, quiz_status, progress_output]).then(lambda d: (global_progress_html(d), progress_detail_html(d)), inputs=[doc_selector], outputs=[global_progress_output, progress_output])
+    ).then(quiz_generate_handler, inputs=[doc_selector], outputs=quiz_outputs, show_progress="minimal")
+    quiz_restart.click(quiz_restart_handler, inputs=[quiz_state], outputs=quiz_outputs, queue=False)
+    quiz_validate.click(
+        quiz_validate_handler,
+        inputs=[quiz_state, quiz_index, quiz_choice, quiz_validated, quiz_answers],
+        outputs=[quiz_validated, quiz_view_box, quiz_status, quiz_answers, quiz_choice, quiz_next],
+        queue=False,
+    )
+    quiz_next.click(
+        quiz_next_handler,
+        inputs=[quiz_state, quiz_index, quiz_validated, quiz_answers, doc_selector],
+        outputs=[quiz_index, quiz_validated, quiz_view_box, quiz_status, quiz_choice, quiz_next],
+        queue=False,
+    ).then(lambda d: (global_progress_html(d), progress_detail_html(d)), inputs=[doc_selector], outputs=[global_progress_output, progress_output], queue=False)
+
+    # Thème clair / sombre (mémorisé dans le navigateur)
+    theme_btn.click(None, None, theme_btn, js=THEME_TOGGLE_JS)
+    demo.load(None, None, theme_btn, js=THEME_INIT_JS)
 
     # Résumé — conserve le comportement existant, mais l'affiche dans son propre espace.
     def summary_handler(d):
