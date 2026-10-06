@@ -537,7 +537,7 @@ def _ui_chat_user_message(message_utilisateur, history, doc_selectionne):
   return "", _chat_history_for_ui(doc_selectionne), message_str
 
 
-def repondre_akori_chat_stream(message_str, doc_selectionne):
+def repondre_akori_chat_stream(message_str, doc_selectionne, lang=None):
   """Étape lourde : retrieval + Gemini streaming, sans réécrire FAISS."""
   if not message_str:
     yield _chat_history_for_ui(doc_selectionne), ""
@@ -597,7 +597,7 @@ def repondre_akori_chat_stream(message_str, doc_selectionne):
     input_tokens_est = _estimate_tokens(user_prompt)
 
     stream_response = _appel_gemini_securise(
-        user_prompt, system_instruction
+        user_prompt, _with_lang(system_instruction, lang)
     )
     session_usage["input_tokens"] += input_tokens_est
 
@@ -645,6 +645,28 @@ def repondre_akori_chat_stream(message_str, doc_selectionne):
 # Interface orientée "AI Study Assistant" : cours -> révision -> flashcards/quiz -> assistant -> progression.
 
 TOKEN_SESSION_LIMIT = 50000
+
+
+LANG_CHOICES = ["Français", "English", "Malagasy"]
+
+
+def _lang_code(label):
+    label = str(label or "")
+    if "English" in label:
+        return "en"
+    if "Malagasy" in label:
+        return "mg"
+    return "fr"
+
+
+def _with_lang(system_instruction, lang):
+    """Ajoute la langue de réponse choisie dans les paramètres."""
+    code = _lang_code(lang)
+    if code == "en":
+        return system_instruction + " IMPORTANT: write the whole answer in English."
+    if code == "mg":
+        return system_instruction + " IMPORTANT: soraty amin'ny teny Malagasy ny valiny rehetra (write the whole answer in Malagasy)."
+    return system_instruction
 
 
 def _escape_html(value):
@@ -741,9 +763,9 @@ def dashboard_html(active_doc=None):
     <div class='guide-box'>
       <h3>💡 Guide de révision AKORI &amp; mode roulette flashcards</h3>
       <div class='guide-grid'>
-        <div class='guide-item'><b>1. Chargez vos dossiers</b><span>Glissez vos PDF dans <i>Mes dossiers</i> pour activer l'indexation FAISS.</span></div>
+        <div class='guide-item'><b>1. Chargez vos dossiers</b><span>Glissez vos PDF dans Mes dossiers pour activer l'indexation FAISS.</span></div>
         <div class='guide-item'><b>2. Lancement roulette</b><span>Générez au moins 7 flashcards. Les questions défilent automatiquement en boucle.</span></div>
-        <div class='guide-item'><b>3. Clic &amp; réponse effacée</b><span>Cliquez sur la carte pour <b>stopper/relancer</b>. La réponse s'efface à chaque relance.</span></div>
+        <div class='guide-item'><b>3. Clic &amp; réponse effacée</b><span>Cliquez sur la carte pour stopper/relancer. La réponse s'efface à chaque relance.</span></div>
       </div>
     </div>
     <div class='stat-row'>
@@ -758,7 +780,7 @@ def dashboard_html(active_doc=None):
       <span class='revision-chip'>Cours actif</span>
     </div>
     <div class='section-head'><div><h2>Mes cours</h2><p>Vos supports de révision indexés localement.</p></div></div>
-    <div class='course-grid'>{cards}</div>
+    <div class='folder-grid'>{cards}</div>
     """
 
 def course_overview_html(active_doc=None):
@@ -983,7 +1005,7 @@ def _flash_generate_fail(message):
     return [], 0, False, flashcard_view([], 0, False), message, gr.update(visible=False), gr.update(value=GENERATE_LABEL)
 
 
-def flashcard_generate_handler(doc_name):
+def flashcard_generate_handler(doc_name, lang=None):
     """Génère une NOUVELLE série (7 flashcards minimum) à chaque appel."""
     if not doc_name or doc_name not in documents_db:
         return _flash_generate_fail("⚠️ Aucun document sélectionné.")
@@ -1004,7 +1026,7 @@ Retourne UNIQUEMENT un JSON valide avec la structure exacte suivante :
 {{"flashcards": [{{"question": "...", "answer": "..."}}]}}"""
             raw = _gemini_structured(
                 prompt,
-                "Tu es AKORI, assistant académique. Base-toi uniquement sur le contexte fourni et n'invente rien.",
+                _with_lang("Tu es AKORI, assistant académique. Base-toi uniquement sur le contexte fourni et n'invente rien.", lang),
                 max_tokens=2500,
             )
             data = _extract_json_from_text(raw)
@@ -1076,13 +1098,13 @@ def flashcard_mark_handler(cards, index, mark_type, doc_name):
 # ============================================================
 # QUIZ — une question à la fois, réponses cliquables
 # ============================================================
-def generate_quiz_v12(doc_name, count=5):
+def generate_quiz_v12(doc_name, count=5, lang=None):
     if not doc_name or doc_name not in documents_db:
         return [], "⚠️ Sélectionnez d'abord un cours."
     context = "\n\n".join(preparer_contexte_global(documents_db[doc_name]))
     prompt = f"""CONTEXTE DU COURS:\n{context}\n\nCrée exactement {count} questions QCM de révision. Une seule bonne réponse par question.\nRetourne uniquement un JSON valide: {{\"questions\":[{{\"question\":\"...\",\"options\":[\"...\",\"...\",\"...\",\"...\"],\"answer\":0,\"explanation\":\"...\",\"topic\":\"notion abordée (2-3 mots)\"}}]}}\nanswer est l'index 0-3 de la bonne option."""
     try:
-        data = _extract_json_from_text(_gemini_structured(prompt, "Tu es AKORI, assistant académique. Base-toi uniquement sur le contexte fourni et n'invente rien."))
+        data = _extract_json_from_text(_gemini_structured(prompt, _with_lang("Tu es AKORI, assistant académique. Base-toi uniquement sur le contexte fourni et n'invente rien.", lang)))
         questions = data.get("questions", []) if isinstance(data, dict) else []
         valid = []
         for q in questions:
@@ -1154,8 +1176,8 @@ def quiz_view(questions, index=0, validated=False, answers=None):
     """
 
 
-def quiz_generate_handler(doc_name):
-    qs, status = generate_quiz_v12(doc_name)
+def quiz_generate_handler(doc_name, lang=None):
+    qs, status = generate_quiz_v12(doc_name, lang=lang)
     return (qs, 0, False, quiz_view(qs, 0, False, []), status,
             _quiz_radio(qs, 0), [None] * len(qs), gr.update(value=NEXT_LABEL))
 
@@ -2047,16 +2069,171 @@ body.sidebar-collapsed:not(:has(#sidebar:hover)) #sidebar .nav-title { opacity:0
 #theme-choice label:has(input:checked) { border-color:#4f46e5!important;background:#eef2ff!important; }
 html:root:root:root:root body.akori-dark #theme-choice label { border-color:#2c3957!important;background:#1b2438!important;color:#e6ebf7!important; }
 html:root:root:root:root body.akori-dark #theme-choice label:has(input:checked) { border-color:#7b8ff7!important;background:#232f55!important; }
+
+/* ===== Accueil : mêmes cartes que « Mes dossiers » ===== */
+.folder-grid { display:grid!important;grid-template-columns:repeat(auto-fill,minmax(200px,1fr))!important;gap:14px!important;align-items:stretch; }
+.folder-grid > .folder-card { min-width:0;height:100%; }
+.folder-grid > .empty-state { grid-column:1 / -1; }
+
+/* ===== Paramètres : cartes + bouton de thème animé + sélecteur de langue ===== */
+.set-card { align-items:center!important;gap:18px!important;background:#fff!important;border:1px solid var(--ak-line)!important;border-radius:18px!important;padding:18px 22px!important;margin:12px 0!important;box-shadow:0 4px 16px rgba(42,55,90,.04);flex-wrap:nowrap!important; }
+.set-card > div:first-child { flex:1 1 auto!important;min-width:0!important; }
+.set-title { font-weight:800;font-size:15px;color:#1f2a44; }
+.set-desc { font-size:12.5px;color:#778298;margin-top:3px;line-height:1.45; }
+html:root:root:root:root body.akori-dark .set-card { background:#161e30!important;border-color:#27324a!important; }
+html:root:root:root:root body.akori-dark .set-title { color:#e6ebf7!important; }
+html:root:root:root:root body.akori-dark .set-desc { color:#9aa6bf!important; }
+
+#theme-toggle-btn {
+  position:relative!important;width:84px!important;min-width:84px!important;max-width:84px!important;height:42px!important;flex:none!important;
+  padding:0!important;border:0!important;border-radius:999px!important;overflow:hidden!important;cursor:pointer;
+  font-size:0!important;color:transparent!important;-webkit-text-fill-color:transparent!important;
+  background:linear-gradient(135deg,#7cc0ff 0%,#d4ecff 100%)!important;
+  box-shadow:inset 0 2px 6px rgba(20,40,90,.18), 0 4px 14px rgba(79,109,245,.18)!important;
+  transition:background .45s ease, box-shadow .45s ease, transform .15s ease!important;
+}
+#theme-toggle-btn:active { transform:scale(.96); }
+#theme-toggle-btn::before {           /* soleil → lune */
+  content:"";position:absolute;top:5px;left:5px;width:32px;height:32px;border-radius:50%;
+  background:#ffc93c;box-shadow:0 0 0 5px rgba(255,201,60,.30), 0 3px 8px rgba(0,0,0,.22);
+  transition:transform .5s cubic-bezier(.68,-.35,.27,1.35), background .4s ease, box-shadow .4s ease;
+}
+#theme-toggle-btn::after {            /* nuage → étoiles */
+  content:"";position:absolute;right:12px;top:17px;width:20px;height:9px;border-radius:9px;background:#fff;opacity:.95;
+  box-shadow:-7px 5px 0 -1px #fff, 5px -5px 0 -2px #fff;
+  transition:opacity .4s ease, transform .5s ease;
+}
+html:root:root:root:root body.akori-dark #theme-toggle-btn {
+  background:linear-gradient(135deg,#090d26 0%,#1c2766 100%)!important;
+  box-shadow:inset 0 2px 8px rgba(0,0,0,.5), 0 4px 14px rgba(0,0,0,.35)!important;
+}
+html:root:root:root:root body.akori-dark #theme-toggle-btn::before {
+  transform:translateX(42px);background:transparent;
+  box-shadow:inset -10px -4px 0 0 #f2efe2, 0 0 14px rgba(242,239,226,.45);
+}
+html:root:root:root:root body.akori-dark #theme-toggle-btn::after {
+  right:auto;left:0;top:0;width:100%;height:100%;border-radius:0;opacity:1;transform:none;
+  background:
+    radial-gradient(circle at 18% 30%,#fff 1.3px,transparent 2.2px),
+    radial-gradient(circle at 34% 68%,#fff 1px,transparent 2px),
+    radial-gradient(circle at 52% 24%,#fff 1.5px,transparent 2.3px),
+    radial-gradient(circle at 26% 82%,#cfd6ff 0.9px,transparent 1.8px);
+  box-shadow:none;
+}
+
+#lang-choice { flex:none!important;min-width:0!important;width:auto!important; }
+#lang-choice .wrap { display:flex!important;gap:4px!important;background:#eef2ff!important;border:0!important;border-radius:14px!important;padding:4px!important; }
+#lang-choice label { border:0!important;border-radius:11px!important;padding:8px 14px!important;cursor:pointer;font-weight:650;font-size:13px;background:transparent!important;color:#52607d!important;transition:background .2s ease,color .2s ease,box-shadow .2s ease; }
+#lang-choice label:hover { background:rgba(255,255,255,.7)!important; }
+#lang-choice label:has(input:checked) { background:#fff!important;color:#3f5ed8!important;box-shadow:0 2px 8px rgba(42,55,90,.14); }
+#lang-choice input[type="radio"] { display:none!important; }
+html:root:root:root:root body.akori-dark #lang-choice .wrap { background:#1b2438!important; }
+html:root:root:root:root body.akori-dark #lang-choice label { color:#b4bfd8!important; }
+html:root:root:root:root body.akori-dark #lang-choice label:has(input:checked) { background:#2a3866!important;color:#fff!important;box-shadow:none; }
+@media (max-width:700px) { .set-card { flex-wrap:wrap!important; } }
+
+/* ===== Mes dossiers : liste de PDF + tuile d'import (largeur fixe, jamais écrasée) ===== */
+#documents-row { display:flex!important;flex-wrap:nowrap!important;gap:14px!important;align-items:flex-start!important; }
+#documents-row > :first-child { flex:1 1 0!important;min-width:0!important; }
+#documents-row #add-document-tile {
+  flex:0 0 210px!important;width:210px!important;min-width:210px!important;max-width:210px!important;
+  height:150px!important;min-height:150px!important;align-self:flex-start!important;
+}
+@media (max-width:760px) {
+  #documents-row { flex-wrap:wrap!important; }
+  #documents-row > :first-child { flex:1 1 100%!important; }
+  #documents-row #add-document-tile { flex:1 1 100%!important;width:100%!important;max-width:none!important;height:110px!important;min-height:110px!important;order:-1; }
+}
 """
 
 
-THEME_APPLY_JS = r"""
-(choice) => {
-  const dark = String(choice).includes('Sombre');
+THEME_TOGGLE_JS = r"""
+() => {
+  const dark = !document.body.classList.contains('akori-dark');
   document.body.classList.toggle('akori-dark', dark);
   document.body.classList.toggle('dark', dark);
   try { localStorage.setItem('akori-theme', dark ? 'dark' : 'light'); } catch (e) {}
 }
+"""
+
+LANG_APPLY_JS = r"""
+(label) => { window.__akTouched = true; if (window.__akoriSetLang) window.__akoriSetLang(label); }
+"""
+
+I18N_SRC = r"""
+  const I18N = [["NAVIGATION", "NAVIGATION", "FIDIRANA"], ["Accueil", "Home", "Fandraisana"], ["Mes dossiers", "My folders", "Ireo rakitra"], ["Réviser", "Revise", "Hamerina"], ["Flashcards", "Flashcards", "Flashcards"], ["Quiz / QCM", "Quiz / MCQ", "Fanontaniana / QCM"], ["Résumé", "Summary", "Fintina"], ["Assistant IA", "AI Assistant", "Mpanampy IA"], ["Progression", "Progress", "Fandrosoana"], ["À revoir", "To review", "Hojerena indray"], ["Historique", "History", "Tantara"], ["Paramètres", "Settings", "Fanamboarana"], ["AKORI · Espace de révision", "AKORI · Revision space", "AKORI · Toerana famerenana lesona"], ["Cours actif", "Active course", "Lesona mavitrika"], ["Bonjour 👋", "Hello 👋", "Salama 👋"], ["Prêt à booster votre révision ?", "Ready to boost your revision?", "Vonona hampandroso ny famerenanao lesona ve?"], ["AKORI transforme vos cours PDF en un espace de révision intelligent : résumé, flashcards roulette, quiz et assistant RAG.", "AKORI turns your PDF courses into a smart revision space: summary, roulette flashcards, quiz and RAG assistant.", "Ovain'i AKORI ho toerana famerenana lesona mahira ny PDF-nao: fintina, flashcards, quiz ary mpanampy RAG."], ["💡 Guide de révision AKORI & mode roulette flashcards", "💡 AKORI revision guide & flashcards roulette mode", "💡 Torolalana AKORI & flashcards roulette"], ["1. Chargez vos dossiers", "1. Load your folders", "1. Ampidiro ny rakitrao"], ["Glissez vos PDF dans Mes dossiers pour activer l'indexation FAISS.", "Drop your PDFs in My folders to enable FAISS indexing.", "Alefaso ao amin'ny Ireo rakitra ny PDF-nao mba hampandehanana ny FAISS."], ["2. Lancement roulette", "2. Start the roulette", "2. Fanombohana ny roulette"], ["Générez au moins 7 flashcards. Les questions défilent automatiquement en boucle.", "Generate at least 7 flashcards. Questions scroll automatically in a loop.", "Mamoròna flashcards 7 farafahakeliny. Mivezivezy ho azy ny fanontaniana."], ["3. Clic & réponse effacée", "3. Click & answer hidden", "3. Tsindrio & miafina ny valiny"], ["Cliquez sur la carte pour stopper/relancer. La réponse s'efface à chaque relance.", "Click the card to stop/restart. The answer is hidden at each restart.", "Tsindrio ny karatra hampijanona/handefa indray. Miafina ny valiny isaky ny mandeha indray."], ["Cours importés", "Imported courses", "Lesona nampidirina"], ["Fragments indexés", "Indexed fragments", "Ampahany voasivana"], ["Échanges du cours", "Course exchanges", "Resaka momba ny lesona"], ["Recherche active", "Search active", "Fikarohana mavitrika"], ["Réviser un cours en un clic", "Revise a course in one click", "Mamerina lesona amin'ny tsindry iray"], ["Générez les outils principaux à partir du cours actif.", "Generate the main tools from the active course.", "Mamoròna ny fitaovana lehibe avy amin'ny lesona mavitrika."], ["Résumé · Flashcards · Quiz / QCM · Assistant IA", "Summary · Flashcards · Quiz / MCQ · AI Assistant", "Fintina · Flashcards · Quiz / QCM · Mpanampy IA"], ["Mes cours", "My courses", "Ny lesoko"], ["Vos supports de révision indexés localement.", "Your revision materials indexed locally.", "Ny fitaovam-pamerenana lesonao voasivana eto an-toerana."], ["Aucun cours sélectionné", "No course selected", "Tsy misy lesona voafidy"], ["Commencer la révision →", "Start revising →", "Atombohy ny famerenana →"], ["Tous vos supports PDF sont centralisés ici. Dès qu'un document est sélectionné, AKORI extrait son contenu et construit automatiquement son index.", "All your PDF materials are gathered here. As soon as a document is selected, AKORI extracts its content and builds its index automatically.", "Eto no ao ny PDF rehetra. Raha vao voafidy ny rakitra iray dia manala ny votoatiny sy mamorona ny index ho azy i AKORI."], ["＋\nAjouter un document", "＋\nAdd a document", "＋\nHanampy rakitra"], ["Sélectionnez un PDF : extraction et indexation automatiques.", "Select a PDF: automatic extraction and indexing.", "Fidio ny PDF: ho azy ny fakana sy fanasivanana."], ["Indexé", "Indexed", "Voasivana"], ["Sélectionnez un cours pour afficher son espace de révision.", "Select a course to display its revision space.", "Fidio ny lesona hanehoana ny toerana famerenana azy."], ["Réviser ce cours", "Revise this course", "Hamerina ity lesona ity"], ["Une vue centrale pour accéder rapidement au résumé, aux flashcards, au quiz et à l'assistant.", "A central view to quickly reach the summary, flashcards, quiz and assistant.", "Fijery mampiray hidirana haingana ny fintina, flashcards, quiz ary mpanampy."], ["Flashcards — Mode Roulette", "Flashcards — Roulette mode", "Flashcards — Fomba roulette"], ["✦ Générer les flashcards", "✦ Generate flashcards", "✦ Mamorona flashcards"], ["🔄 Régénérer (7 minimum)", "🔄 Regenerate (7 minimum)", "🔄 Averina (7 farafahakeliny)"], ["Afficher la réponse", "Show the answer", "Asehoy ny valiny"], ["✓ Je savais", "✓ I knew it", "✓ Fantatro"], ["↻ À revoir", "↻ To review", "↻ Hojerena indray"], ["Aucune flashcard générée.", "No flashcards generated.", "Tsy mbola misy flashcard noforonina."], ["Choisissez un cours puis cliquez sur « Générer les flashcards ».", "Choose a course then click “Generate flashcards”.", "Fidio ny lesona dia tsindrio ny « Mamorona flashcards »."], ["Quiz d'évaluation", "Evaluation quiz", "Quiz fanombanana"], ["Cliquez sur une réponse, validez, puis passez à la question suivante.", "Click an answer, validate, then go to the next question.", "Tsindrio ny valiny, apetraho, dia mandehana amin'ny fanontaniana manaraka."], ["✦ Générer le quiz", "✦ Generate the quiz", "✦ Mamorona ny quiz"], ["🔁 Rejouer", "🔁 Replay", "🔁 Averina"], ["Valider la réponse", "Validate the answer", "Apetraho ny valiny"], ["Question suivante →", "Next question →", "Fanontaniana manaraka →"], ["Voir le résultat 🎯", "See the result 🎯", "Jereo ny valiny 🎯"], ["Choisissez votre réponse", "Choose your answer", "Fidio ny valinao"], ["Aucun quiz généré.", "No quiz generated.", "Tsy mbola misy quiz noforonina."], ["Choisissez un cours puis cliquez sur « Générer le quiz ».", "Choose a course then click “Generate the quiz”.", "Fidio ny lesona dia tsindrio ny « Mamorona ny quiz »."], ["Résumé du cours", "Course summary", "Fintinin'ny lesona"], ["Générer le résumé", "Generate the summary", "Mamorona ny fintina"], ["Sélectionnez un cours puis lancez la génération.", "Select a course then start the generation.", "Fidio ny lesona dia alefaso ny famoronana."], ["Assistant AKORI", "AKORI Assistant", "Mpanampy AKORI"], ["Posez une question sur le cours actif. Le moteur récupère d'abord les passages pertinents avec FAISS, puis Gemini génère la réponse à partir du contexte récupéré.", "Ask a question about the active course. The engine first retrieves the relevant passages with FAISS, then Gemini generates the answer from the retrieved context.", "Manontania momba ny lesona mavitrika. Mandray ny fizarana mifandraika amin'izany amin'ny FAISS aloha ny rafitra, dia mamorona ny valiny i Gemini."], ["Envoyer", "Send", "Alefa"], ["Posez une question sur le cours…", "Ask a question about the course…", "Manontania momba ny lesona…"], ["Ma progression", "My progress", "Ny fandrosoako"], ["Commencez par la vue globale, puis consultez le détail du cours sélectionné.", "Start with the global view, then check the details of the selected course.", "Atombohy amin'ny fijery iray manontolo, dia jereo ny antsipirian'ny lesona voafidy."], ["Détail du cours sélectionné", "Selected course details", "Antsipirian'ny lesona voafidy"], ["Cette section regroupera les flashcards marquées « À revoir » et les erreurs de quiz.", "This section will gather the flashcards marked “To review” and the quiz mistakes.", "Eto no hanangonana ny flashcards voamarika « Hojerena indray » sy ny hadisoana tamin'ny quiz."], ["Historique du cours actif", "Active course history", "Tantaran'ny lesona mavitrika"], ["Aucun historique pour le moment.", "No history yet.", "Mbola tsy misy tantara."], ["Paramètres", "Settings", "Fanamboarana"], ["Personnalisez AKORI. Vos choix sont mémorisés dans ce navigateur.", "Customize AKORI. Your choices are saved in this browser.", "Ataovy araka ny tianao i AKORI. Voatahiry ao amin'ity navigateur ity ny safidinao."], ["Mode sombre", "Dark mode", "Maody maizina"], ["Basculez entre le thème clair et le thème sombre d'un seul clic.", "Switch between the light and dark theme with one click.", "Ovao amin'ny tsindry iray ny lohahevitra mazava sy maizina."], ["Langue", "Language", "Fiteny"], ["Langue de l'interface et des réponses générées par l'IA.", "Language of the interface and of the answers generated by the AI.", "Fiteny ampiasaina amin'ny interface sy ny valin'ny IA."], ["⏳ Génération des flashcards…", "⏳ Generating flashcards…", "⏳ Famoronana flashcards…"], ["⏳ Génération du quiz…", "⏳ Generating the quiz…", "⏳ Famoronana ny quiz…"], ["⏳ Génération du résumé…", "⏳ Generating the summary…", "⏳ Famoronana ny fintina…"], ["⚠️ Sélectionnez d'abord un cours.", "⚠️ Select a course first.", "⚠️ Fidio aloha ny lesona."], ["⚠️ Sélectionnez une réponse avant de valider.", "⚠️ Select an answer before validating.", "⚠️ Fidio ny valiny alohan'ny hanamarina."], ["✅ Bonne réponse.", "✅ Correct answer.", "✅ Valiny marina."], ["QUIZ TERMINÉ", "QUIZ COMPLETED", "VITA NY QUIZ"], ["SESSION TERMINÉE", "SESSION COMPLETED", "VITA NY FIANARANA"], ["Maîtrise", "Mastery", "Fahaizana"], ["Maîtrisées", "Mastered", "Fehezina"], ["Aucun cours pour le moment.", "No course yet.", "Mbola tsy misy lesona."]];
+  const LANG_INDEX = { fr: 0, en: 1, mg: 2 };
+  const codeOf = (label) => /English/.test(label) ? 'en' : (/Malagasy/.test(label) ? 'mg' : 'fr');
+  const labelOf = (code) => ({ fr: 'Français', en: 'English', mg: 'Malagasy' }[code] || 'Français');
+  const map = { en: new Map(), mg: new Map() };
+  I18N.forEach(([fr, en, mg]) => { map.en.set(fr.trim(), en); map.mg.set(fr.trim(), mg); });
+  window.__akoriLang = window.__akoriLang || 'fr';
+  const tr = (frText, lang) => {
+    if (lang === 'fr') return frText;
+    const key = frText.trim();
+    const out = map[lang].get(key);
+    if (!out) return frText;
+    const lead = frText.match(/^\s*/)[0], trail = frText.match(/\s*$/)[0];
+    return lead + out + trail;
+  };
+  const SKIP = new Set(['SCRIPT', 'STYLE', 'TEXTAREA', 'IFRAME']);
+  const translateTextNode = (node) => {
+    // Reconnaît un texte réécrit par l'application (donc de nouveau en français).
+    if (node.__akLast === undefined || node.nodeValue !== node.__akLast) node.__akFr = node.nodeValue;
+    const out = tr(node.__akFr, window.__akoriLang);
+    if (node.nodeValue !== out) node.nodeValue = out;
+    node.__akLast = node.nodeValue;
+  };
+  const translateAttrs = (el) => {
+    if (el.placeholder !== undefined && el.tagName && /INPUT|TEXTAREA/.test(el.tagName)) {
+      if (el.__akPh === undefined || (el.placeholder !== el.__akPhLast)) el.__akPh = el.placeholder;
+      const out = tr(el.__akPh, window.__akoriLang);
+      if (el.placeholder !== out) el.placeholder = out;
+      el.__akPhLast = el.placeholder;
+    }
+  };
+  const walk = (root) => {
+    if (!root) return;
+    if (root.nodeType === 3) { if (root.parentNode && !SKIP.has(root.parentNode.tagName)) translateTextNode(root); return; }
+    if (root.nodeType !== 1 || SKIP.has(root.tagName)) return;
+    translateAttrs(root);
+    const tw = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+    let n;
+    while ((n = tw.nextNode())) {
+      if (n.nodeType === 3) { if (n.parentNode && !SKIP.has(n.parentNode.tagName)) translateTextNode(n); }
+      else translateAttrs(n);
+    }
+  };
+  let pending = false;
+  const schedule = (nodes) => {
+    nodes.forEach((n) => (window.__akPendingNodes = window.__akPendingNodes || new Set()).add(n));
+    if (pending) return;
+    pending = true;
+    requestAnimationFrame(() => {
+      pending = false;
+      const set = window.__akPendingNodes || new Set(); window.__akPendingNodes = new Set();
+      set.forEach((n) => { if (n.isConnected) walk(n); });
+    });
+  };
+  window.__akoriSetLang = (label) => {
+    const code = codeOf(String(label));
+    window.__akoriLang = code;
+    try { localStorage.setItem('akori-lang', code); } catch (e) {}
+    document.documentElement.lang = code;
+    walk(document.body);
+  };
+  if (!window.__akoriI18nObserver) {
+    window.__akoriI18nObserver = new MutationObserver((muts) => {
+      if (window.__akoriLang === 'fr' && !window.__akTouched) return;
+      const nodes = [];
+      muts.forEach((m) => {
+        if (m.type === 'characterData') nodes.push(m.target);
+        else m.addedNodes.forEach((a) => nodes.push(a));
+      });
+      if (nodes.length) schedule(nodes);
+    });
+    window.__akoriI18nObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
+  }
 """
 
 THEME_INIT_JS = r"""
@@ -2071,6 +2248,11 @@ THEME_INIT_JS = r"""
   document.body.classList.toggle('akori-dark', dark);
   document.body.classList.toggle('dark', dark);
   document.body.classList.toggle('sidebar-collapsed', collapsed);
+  /*I18N*/
+  let lang = 'fr';
+  try { lang = localStorage.getItem('akori-lang') || 'fr'; } catch (e) {}
+  if (lang !== 'fr') window.__akTouched = true;
+  window.__akoriSetLang(labelOf(lang));
   if (!window.__akoriSidebarBound) {
     window.__akoriSidebarBound = true;
     // Le menu est fixe : on l'aligne sur le bord gauche réel de la grille Gradio.
@@ -2092,9 +2274,11 @@ THEME_INIT_JS = r"""
       }
     });
   }
-  return dark ? '🌙 Sombre' : '☀️ Clair';
+  return labelOf(lang);
 }
 """
+
+THEME_INIT_JS = THEME_INIT_JS.replace('/*I18N*/', I18N_SRC)
 
 SIDEBAR_TOGGLE_JS = r"""
 () => {
@@ -2257,12 +2441,13 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
 
                 with gr.Tab("Paramètres", id="settings"):
                     gr.Markdown("## Paramètres")
-                    gr.Markdown("### Apparence")
-                    theme_choice = gr.Radio(
-                        choices=["☀️ Clair", "🌙 Sombre"], value="☀️ Clair",
-                        label="Thème de l'interface", elem_id="theme-choice",
-                    )
-                    gr.Markdown("Votre choix est mémorisé dans ce navigateur. Le bouton ☰ en haut à gauche ouvre et ferme le menu latéral.")
+                    gr.Markdown("Personnalisez AKORI. Vos choix sont mémorisés dans ce navigateur.")
+                    with gr.Row(elem_classes="set-card"):
+                        gr.HTML("<div class='set-text'><div class='set-title'>Mode sombre</div><div class='set-desc'>Basculez entre le thème clair et le thème sombre d'un seul clic.</div></div>")
+                        theme_toggle = gr.Button(" ", elem_id="theme-toggle-btn", scale=0, min_width=84)
+                    with gr.Row(elem_classes="set-card"):
+                        gr.HTML("<div class='set-text'><div class='set-title'>Langue</div><div class='set-desc'>Langue de l'interface et des réponses générées par l'IA.</div></div>")
+                        lang_choice = gr.Radio(choices=LANG_CHOICES, value="Français", show_label=False, container=False, elem_id="lang-choice", scale=0)
 
                 with gr.Tab("Historique", id="history"):
                     gr.Markdown("## Historique du cours actif")
@@ -2330,7 +2515,7 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
     )
     send_event.then(
         repondre_akori_chat_stream,
-        inputs=[pending_message, doc_selector],
+        inputs=[pending_message, doc_selector, lang_choice],
         outputs=[chatbot, pending_message],
     )
 
@@ -2342,7 +2527,7 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
     )
     submit_event.then(
         repondre_akori_chat_stream,
-        inputs=[pending_message, doc_selector],
+        inputs=[pending_message, doc_selector, lang_choice],
         outputs=[chatbot, pending_message],
     )
 
@@ -2351,7 +2536,7 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
         lambda: "⏳ Génération des flashcards…", outputs=[flash_status], queue=False,
     ).then(
         flashcard_generate_handler,
-        inputs=[doc_selector],
+        inputs=[doc_selector, lang_choice],
         outputs=[flashcards_state, flash_index, flash_revealed, flash_view, flash_status, flash_actions, generate_flash],
         show_progress="minimal",
         concurrency_limit=1,
@@ -2379,7 +2564,7 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
     quiz_outputs = [quiz_state, quiz_index, quiz_validated, quiz_view_box, quiz_status, quiz_choice, quiz_answers, quiz_next]
     generate_quiz_btn.click(
         lambda: "⏳ Génération du quiz…", outputs=[quiz_status], queue=False
-    ).then(quiz_generate_handler, inputs=[doc_selector], outputs=quiz_outputs, show_progress="minimal")
+    ).then(quiz_generate_handler, inputs=[doc_selector, lang_choice], outputs=quiz_outputs, show_progress="minimal")
     quiz_restart.click(quiz_restart_handler, inputs=[quiz_state], outputs=quiz_outputs, queue=False)
     quiz_validate.click(
         quiz_validate_handler,
@@ -2395,25 +2580,26 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
     ).then(lambda d: (global_progress_html(d), progress_detail_html(d)), inputs=[doc_selector], outputs=[global_progress_output, progress_output], queue=False)
 
     # Thème clair / sombre (mémorisé dans le navigateur)
-    theme_choice.input(None, theme_choice, None, js=THEME_APPLY_JS)
+    theme_toggle.click(None, None, None, js=THEME_TOGGLE_JS)
+    lang_choice.input(None, lang_choice, None, js=LANG_APPLY_JS)
     menu_btn.click(None, None, None, js=SIDEBAR_TOGGLE_JS)
-    demo.load(None, None, theme_choice, js=THEME_INIT_JS)
+    demo.load(None, None, lang_choice, js=THEME_INIT_JS)
 
     # Résumé — conserve le comportement existant, mais l'affiche dans son propre espace.
-    def summary_handler(d):
+    def summary_handler(d, lang=None):
         if not d or d not in documents_db:
             return "⚠️ Sélectionnez d'abord un cours."
         context = "\n\n".join(preparer_contexte_global(documents_db[d]))
         prompt = f"CONTEXTE DU COURS:\n{context}\n\nDEMANDE: Fais un résumé synthétique des points clés principaux de ce document."
         try:
-            response = _gemini_structured(prompt, "Tu es AKORI. Résume uniquement les informations présentes dans le contexte fourni. Retourne un JSON {\"summary\":\"...\"}.")
+            response = _gemini_structured(prompt, _with_lang("Tu es AKORI. Résume uniquement les informations présentes dans le contexte fourni. Retourne un JSON {\"summary\":\"...\"}.", lang))
             data = _extract_json_from_text(response)
             return data.get("summary", response) if isinstance(data, dict) else response
         except Exception as e:
             return f"⚠️ {e}"
     summary_btn.click(
         lambda: "⏳ Génération du résumé…", outputs=summary_output, queue=False
-    ).then(summary_handler, inputs=doc_selector, outputs=summary_output)
+    ).then(summary_handler, inputs=[doc_selector, lang_choice], outputs=summary_output)
 
     demo.load(lambda: (dashboard_html(doc_selector.value), documents_html_v16(doc_selector.value), course_overview_html(doc_selector.value), course_overview_html(doc_selector.value), global_progress_html(doc_selector.value), progress_detail_html(doc_selector.value), _chat_history_for_ui(doc_selector.value), history_view(doc_selector.value)), outputs=[home_html, docs_html, course_info, review_cards, global_progress_output, progress_output, chatbot, history_box])
 
