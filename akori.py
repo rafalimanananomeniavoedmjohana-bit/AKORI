@@ -1826,110 +1826,110 @@ html, body, .gradio-container,
 #theme-toggle { max-width:150px!important;min-width:130px!important; }
 
 /* ===== THÈME SOMBRE ===== */
-html:has(body.akori-dark), body.akori-dark { background:#0e1422!important; }
-body.akori-dark {
+html:has(body.akori-dark), html:root:root:root:root body.akori-dark { background:#0e1422!important; }
+html:root:root:root:root body.akori-dark {
   --ak-bg:#0e1422; --ak-card:#161e30; --ak-text:#e6ebf7; --ak-muted:#9aa6bf;
   --ak-soft:#1c2540; --ak-line:#27324a; --ak-blue-dark:#8ea2ff;
 }
-body.akori-dark, body.akori-dark .gradio-container { background:#0e1422!important;color:#e6ebf7!important; }
-body.akori-dark .gradio-container p, body.akori-dark .gradio-container span:not(.katex *) { color:#a3aec6; }
-body.akori-dark .gradio-container h1, body.akori-dark .gradio-container h2,
-body.akori-dark .gradio-container h3, body.akori-dark .gradio-container h4,
-body.akori-dark .gradio-container strong, body.akori-dark .gradio-container label,
-body.akori-dark .gr-markdown, body.akori-dark .prose { color:#e6ebf7!important; }
+html:root:root:root:root body.akori-dark, html:root:root:root:root body.akori-dark .gradio-container { background:#0e1422!important;color:#e6ebf7!important; }
+html:root:root:root:root body.akori-dark .gradio-container p, html:root:root:root:root body.akori-dark .gradio-container span:not(.katex *) { color:#a3aec6; }
+html:root:root:root:root body.akori-dark .gradio-container h1, html:root:root:root:root body.akori-dark .gradio-container h2,
+html:root:root:root:root body.akori-dark .gradio-container h3, html:root:root:root:root body.akori-dark .gradio-container h4,
+html:root:root:root:root body.akori-dark .gradio-container strong, html:root:root:root:root body.akori-dark .gradio-container label,
+html:root:root:root:root body.akori-dark .gr-markdown, html:root:root:root:root body.akori-dark .prose { color:#e6ebf7!important; }
 
 /* surfaces */
-body.akori-dark #sidebar, body.akori-dark #sidebar .block, body.akori-dark #sidebar .form, body.akori-dark #sidebar .gr-column,
-body.akori-dark #topbar, body.akori-dark .mini-stat, body.akori-dark .revision-banner, body.akori-dark .course-card,
-body.akori-dark .folder-card, body.akori-dark .flashcard, body.akori-dark .quiz-card, body.akori-dark .global-metrics>div,
-body.akori-dark .global-course-list, body.akori-dark .progress-hero, body.akori-dark .progress-metrics>div,
-body.akori-dark .progress-box, body.akori-dark .course-overview, body.akori-dark .quiz-result,
-body.akori-dark .quiz-miss-list, body.akori-dark .history-ai, body.akori-dark .guide-box,
-body.akori-dark .empty-state, body.akori-dark .empty-study, body.akori-dark .progress-list,
-body.akori-dark .progress-panel {
+html:root:root:root:root body.akori-dark #sidebar, html:root:root:root:root body.akori-dark #sidebar .block, html:root:root:root:root body.akori-dark #sidebar .form, html:root:root:root:root body.akori-dark #sidebar .gr-column,
+html:root:root:root:root body.akori-dark #topbar, html:root:root:root:root body.akori-dark .mini-stat, html:root:root:root:root body.akori-dark .revision-banner, html:root:root:root:root body.akori-dark .course-card,
+html:root:root:root:root body.akori-dark .folder-card, html:root:root:root:root body.akori-dark .flashcard, html:root:root:root:root body.akori-dark .quiz-card, html:root:root:root:root body.akori-dark .global-metrics>div,
+html:root:root:root:root body.akori-dark .global-course-list, html:root:root:root:root body.akori-dark .progress-hero, html:root:root:root:root body.akori-dark .progress-metrics>div,
+html:root:root:root:root body.akori-dark .progress-box, html:root:root:root:root body.akori-dark .course-overview, html:root:root:root:root body.akori-dark .quiz-result,
+html:root:root:root:root body.akori-dark .quiz-miss-list, html:root:root:root:root body.akori-dark .history-ai, html:root:root:root:root body.akori-dark .guide-box,
+html:root:root:root:root body.akori-dark .empty-state, html:root:root:root:root body.akori-dark .empty-study, html:root:root:root:root body.akori-dark .progress-list,
+html:root:root:root:root body.akori-dark .progress-panel {
   background:#161e30!important;border-color:#27324a!important;
 }
-body.akori-dark .hero { background:linear-gradient(120deg,#16203a 0%,#1b1838 100%)!important;border-color:#2a3558!important; }
-body.akori-dark .global-progress-hero { background:linear-gradient(135deg,#161e30,#1a2036)!important;border-color:#27324a!important; }
-body.akori-dark .guide-item, body.akori-dark .global-detail-hint, body.akori-dark .progress-note,
-body.akori-dark .progress-empty, body.akori-dark .quiz-explanation, body.akori-dark .answer-hidden,
-body.akori-dark .global-course-row.active-progress-course { background:#1b2438!important;border-color:#27324a!important; }
-body.akori-dark .history-user, body.akori-dark .revision-chip, body.akori-dark .quiz-stats>div { background:#1c2540!important; }
-body.akori-dark .global-progress-ring:before, body.akori-dark .progress-ring:before { background:#161e30!important; }
-body.akori-dark .global-progress-ring, body.akori-dark .progress-ring { background:conic-gradient(#7b8ff7 var(--progress,0%),#27324a 0)!important; }
-body.akori-dark .global-course-bar, body.akori-dark .quiz-bar { background:#27324a!important; }
-body.akori-dark .global-course-row, body.akori-dark .strength-row, body.akori-dark .weakness-row,
-body.akori-dark .quiz-miss, body.akori-dark .progress-list div { border-color:#27324a!important; }
+html:root:root:root:root body.akori-dark .hero { background:linear-gradient(120deg,#16203a 0%,#1b1838 100%)!important;border-color:#2a3558!important; }
+html:root:root:root:root body.akori-dark .global-progress-hero { background:linear-gradient(135deg,#161e30,#1a2036)!important;border-color:#27324a!important; }
+html:root:root:root:root body.akori-dark .guide-item, html:root:root:root:root body.akori-dark .global-detail-hint, html:root:root:root:root body.akori-dark .progress-note,
+html:root:root:root:root body.akori-dark .progress-empty, html:root:root:root:root body.akori-dark .quiz-explanation, html:root:root:root:root body.akori-dark .answer-hidden,
+html:root:root:root:root body.akori-dark .global-course-row.active-progress-course { background:#1b2438!important;border-color:#27324a!important; }
+html:root:root:root:root body.akori-dark .history-user, html:root:root:root:root body.akori-dark .revision-chip, html:root:root:root:root body.akori-dark .quiz-stats>div { background:#1c2540!important; }
+html:root:root:root:root body.akori-dark .global-progress-ring:before, html:root:root:root:root body.akori-dark .progress-ring:before { background:#161e30!important; }
+html:root:root:root:root body.akori-dark .global-progress-ring, html:root:root:root:root body.akori-dark .progress-ring { background:conic-gradient(#7b8ff7 var(--progress,0%),#27324a 0)!important; }
+html:root:root:root:root body.akori-dark .global-course-bar, html:root:root:root:root body.akori-dark .quiz-bar { background:#27324a!important; }
+html:root:root:root:root body.akori-dark .global-course-row, html:root:root:root:root body.akori-dark .strength-row, html:root:root:root:root body.akori-dark .weakness-row,
+html:root:root:root:root body.akori-dark .quiz-miss, html:root:root:root:root body.akori-dark .progress-list div { border-color:#27324a!important; }
 
 /* textes principaux */
-body.akori-dark .mini-stat b, body.akori-dark .global-metrics b, body.akori-dark .progress-metrics b,
-body.akori-dark .section-head h2, body.akori-dark .hero h1, body.akori-dark .revision-banner strong,
-body.akori-dark .folder-card-name, body.akori-dark .course-title, body.akori-dark .course-overview-title,
-body.akori-dark .progress-title, body.akori-dark .global-course-main b, body.akori-dark .global-list-title,
-body.akori-dark .progress-box h3, body.akori-dark .quiz-score, body.akori-dark .global-progress-copy h2,
-body.akori-dark .global-progress-ring span, body.akori-dark .progress-ring span, body.akori-dark .strength-row,
-body.akori-dark .weakness-row, body.akori-dark .history-user, body.akori-dark .history-ai,
-body.akori-dark .option, body.akori-dark .flashcard h2, body.akori-dark .quiz-card h2,
-body.akori-dark .quiz-miss b, body.akori-dark #sidebar .brand-name { color:#e6ebf7!important; }
-body.akori-dark .hero h1 span { color:#8ea2ff!important; }
-body.akori-dark .hero p, body.akori-dark .home-slogan, body.akori-dark .mini-stat span, body.akori-dark .global-metrics span,
-body.akori-dark .progress-metrics span, body.akori-dark .section-head p, body.akori-dark .revision-banner span,
-body.akori-dark .folder-card-size, body.akori-dark .folder-card-date, body.akori-dark .course-overview-file,
-body.akori-dark .course-overview-meta, body.akori-dark .global-course-main small, body.akori-dark .progress-sub,
-body.akori-dark .quiz-topline, body.akori-dark .quiz-result p, body.akori-dark .guide-item span,
-body.akori-dark #sidebar .brand-sub, body.akori-dark #sidebar .sidebar-note { color:#9aa6bf!important; }
-body.akori-dark .eyebrow, body.akori-dark .card-label, body.akori-dark .quiz-result-kicker { color:#8ea2ff!important; }
+html:root:root:root:root body.akori-dark .mini-stat b, html:root:root:root:root body.akori-dark .global-metrics b, html:root:root:root:root body.akori-dark .progress-metrics b,
+html:root:root:root:root body.akori-dark .section-head h2, html:root:root:root:root body.akori-dark .hero h1, html:root:root:root:root body.akori-dark .revision-banner strong,
+html:root:root:root:root body.akori-dark .folder-card-name, html:root:root:root:root body.akori-dark .course-title, html:root:root:root:root body.akori-dark .course-overview-title,
+html:root:root:root:root body.akori-dark .progress-title, html:root:root:root:root body.akori-dark .global-course-main b, html:root:root:root:root body.akori-dark .global-list-title,
+html:root:root:root:root body.akori-dark .progress-box h3, html:root:root:root:root body.akori-dark .quiz-score, html:root:root:root:root body.akori-dark .global-progress-copy h2,
+html:root:root:root:root body.akori-dark .global-progress-ring span, html:root:root:root:root body.akori-dark .progress-ring span, html:root:root:root:root body.akori-dark .strength-row,
+html:root:root:root:root body.akori-dark .weakness-row, html:root:root:root:root body.akori-dark .history-user, html:root:root:root:root body.akori-dark .history-ai,
+html:root:root:root:root body.akori-dark .option, html:root:root:root:root body.akori-dark .flashcard h2, html:root:root:root:root body.akori-dark .quiz-card h2,
+html:root:root:root:root body.akori-dark .quiz-miss b, html:root:root:root:root body.akori-dark #sidebar .brand-name { color:#e6ebf7!important; }
+html:root:root:root:root body.akori-dark .hero h1 span { color:#8ea2ff!important; }
+html:root:root:root:root body.akori-dark .hero p, html:root:root:root:root body.akori-dark .home-slogan, html:root:root:root:root body.akori-dark .mini-stat span, html:root:root:root:root body.akori-dark .global-metrics span,
+html:root:root:root:root body.akori-dark .progress-metrics span, html:root:root:root:root body.akori-dark .section-head p, html:root:root:root:root body.akori-dark .revision-banner span,
+html:root:root:root:root body.akori-dark .folder-card-size, html:root:root:root:root body.akori-dark .folder-card-date, html:root:root:root:root body.akori-dark .course-overview-file,
+html:root:root:root:root body.akori-dark .course-overview-meta, html:root:root:root:root body.akori-dark .global-course-main small, html:root:root:root:root body.akori-dark .progress-sub,
+html:root:root:root:root body.akori-dark .quiz-topline, html:root:root:root:root body.akori-dark .quiz-result p, html:root:root:root:root body.akori-dark .guide-item span,
+html:root:root:root:root body.akori-dark #sidebar .brand-sub, html:root:root:root:root body.akori-dark #sidebar .sidebar-note { color:#9aa6bf!important; }
+html:root:root:root:root body.akori-dark .eyebrow, html:root:root:root:root body.akori-dark .card-label, html:root:root:root:root body.akori-dark .quiz-result-kicker { color:#8ea2ff!important; }
 
 /* boutons de navigation */
-body.akori-dark #sidebar .navbtn, body.akori-dark #sidebar .navbtn.gr-button, body.akori-dark #sidebar button,
-body.akori-dark #sidebar .gr-button { background:#161e30!important;color:#c9d2e6!important;-webkit-text-fill-color:#c9d2e6!important; }
-body.akori-dark #sidebar .navbtn *, body.akori-dark #sidebar button * { color:#c9d2e6!important;-webkit-text-fill-color:#c9d2e6!important; }
-body.akori-dark #sidebar .navbtn:hover, body.akori-dark #sidebar button:hover,
-body.akori-dark #sidebar .navbtn:focus { background:#1f2a45!important;color:#a8b8ff!important;-webkit-text-fill-color:#a8b8ff!important;border-color:#2f3d66!important; }
-body.akori-dark .gradio-container .gr-button:not(.primary), body.akori-dark .gradio-container button:not(.primary):not(.navbtn) {
+html:root:root:root:root body.akori-dark #sidebar .navbtn, html:root:root:root:root body.akori-dark #sidebar .navbtn.gr-button, html:root:root:root:root body.akori-dark #sidebar button,
+html:root:root:root:root body.akori-dark #sidebar .gr-button { background:#161e30!important;color:#c9d2e6!important;-webkit-text-fill-color:#c9d2e6!important; }
+html:root:root:root:root body.akori-dark #sidebar .navbtn *, html:root:root:root:root body.akori-dark #sidebar button * { color:#c9d2e6!important;-webkit-text-fill-color:#c9d2e6!important; }
+html:root:root:root:root body.akori-dark #sidebar .navbtn:hover, html:root:root:root:root body.akori-dark #sidebar button:hover,
+html:root:root:root:root body.akori-dark #sidebar .navbtn:focus { background:#1f2a45!important;color:#a8b8ff!important;-webkit-text-fill-color:#a8b8ff!important;border-color:#2f3d66!important; }
+html:root:root:root:root body.akori-dark .gradio-container .gr-button:not(.primary), html:root:root:root:root body.akori-dark .gradio-container button:not(.primary):not(.navbtn) {
   background:#1b2438!important;color:#d5dcf0!important;-webkit-text-fill-color:#d5dcf0!important;border-color:#2c3957!important; }
-body.akori-dark #sidebar .primary, body.akori-dark #sidebar button.primary { background:linear-gradient(135deg,#4f6df5,#707cf0)!important;color:#fff!important;-webkit-text-fill-color:#fff!important; }
+html:root:root:root:root body.akori-dark #sidebar .primary, html:root:root:root:root body.akori-dark #sidebar button.primary { background:linear-gradient(135deg,#4f6df5,#707cf0)!important;color:#fff!important;-webkit-text-fill-color:#fff!important; }
 
 /* champs */
-body.akori-dark .gradio-container input, body.akori-dark .gradio-container textarea, body.akori-dark .gradio-container select,
-body.akori-dark #assistant-input textarea, body.akori-dark #assistant-input input,
-body.akori-dark #topbar .gr-dropdown, body.akori-dark #topbar .gr-dropdown .wrap, body.akori-dark #topbar .gr-dropdown input {
+html:root:root:root:root body.akori-dark .gradio-container input, html:root:root:root:root body.akori-dark .gradio-container textarea, html:root:root:root:root body.akori-dark .gradio-container select,
+html:root:root:root:root body.akori-dark #assistant-input textarea, html:root:root:root:root body.akori-dark #assistant-input input,
+html:root:root:root:root body.akori-dark #topbar .gr-dropdown, html:root:root:root:root body.akori-dark #topbar .gr-dropdown .wrap, html:root:root:root:root body.akori-dark #topbar .gr-dropdown input {
   background:#1b2438!important;color:#e6ebf7!important;border-color:#2c3957!important; }
-body.akori-dark .gradio-container .wrap, body.akori-dark .gradio-container .input-container { background:#1b2438!important;border-color:#2c3957!important; }
-body.akori-dark #topbar label, body.akori-dark #topbar .prose, body.akori-dark #topbar h3 { color:#c9d2e6!important; }
+html:root:root:root:root body.akori-dark .gradio-container .wrap, html:root:root:root:root body.akori-dark .gradio-container .input-container { background:#1b2438!important;border-color:#2c3957!important; }
+html:root:root:root:root body.akori-dark #topbar label, html:root:root:root:root body.akori-dark #topbar .prose, html:root:root:root:root body.akori-dark #topbar h3 { color:#c9d2e6!important; }
 
 /* chat */
-body.akori-dark #assistant-chatbot, body.akori-dark #assistant-chatbot > div, body.akori-dark #assistant-chatbot .wrap,
-body.akori-dark #assistant-chatbot [data-testid="chatbot"] { background:#161e30!important;border-color:#27324a!important; }
-body.akori-dark #assistant-chatbot [data-testid="bot"], body.akori-dark #assistant-chatbot .message.bot { background:#1b2438!important;border-color:#2c3957!important; }
-body.akori-dark #assistant-chatbot [data-testid="user"], body.akori-dark #assistant-chatbot .message.user { background:#232f55!important;border-color:#33427a!important; }
-body.akori-dark #assistant-chatbot .message, body.akori-dark #assistant-chatbot .prose, body.akori-dark #assistant-chatbot .prose *,
-body.akori-dark #assistant-chatbot p, body.akori-dark #assistant-chatbot li, body.akori-dark #assistant-chatbot span,
-body.akori-dark #assistant-chatbot div { color:#dbe2f3!important;-webkit-text-fill-color:#dbe2f3!important; }
-body.akori-dark #assistant-chatbot code, body.akori-dark #assistant-chatbot pre { background:#0f1626!important;color:#dbe2f3!important;border-color:#27324a!important; }
-body.akori-dark .katex, body.akori-dark .katex * { color:#e6ebf7!important; }
+html:root:root:root:root body.akori-dark #assistant-chatbot, html:root:root:root:root body.akori-dark #assistant-chatbot > div, html:root:root:root:root body.akori-dark #assistant-chatbot .wrap,
+html:root:root:root:root body.akori-dark #assistant-chatbot [data-testid="chatbot"] { background:#161e30!important;border-color:#27324a!important; }
+html:root:root:root:root body.akori-dark #assistant-chatbot [data-testid="bot"], html:root:root:root:root body.akori-dark #assistant-chatbot .message.bot { background:#1b2438!important;border-color:#2c3957!important; }
+html:root:root:root:root body.akori-dark #assistant-chatbot [data-testid="user"], html:root:root:root:root body.akori-dark #assistant-chatbot .message.user { background:#232f55!important;border-color:#33427a!important; }
+html:root:root:root:root body.akori-dark #assistant-chatbot .message, html:root:root:root:root body.akori-dark #assistant-chatbot .prose, html:root:root:root:root body.akori-dark #assistant-chatbot .prose *,
+html:root:root:root:root body.akori-dark #assistant-chatbot p, html:root:root:root:root body.akori-dark #assistant-chatbot li, html:root:root:root:root body.akori-dark #assistant-chatbot span,
+html:root:root:root:root body.akori-dark #assistant-chatbot div { color:#dbe2f3!important;-webkit-text-fill-color:#dbe2f3!important; }
+html:root:root:root:root body.akori-dark #assistant-chatbot code, html:root:root:root:root body.akori-dark #assistant-chatbot pre { background:#0f1626!important;color:#dbe2f3!important;border-color:#27324a!important; }
+html:root:root:root:root body.akori-dark .katex, html:root:root:root:root body.akori-dark .katex * { color:#e6ebf7!important; }
 
 /* quiz */
-body.akori-dark .option { border-color:#2c3957!important;background:#1b2438!important; }
-body.akori-dark .option span { background:#27324a!important;color:#c9d2e6!important; }
-body.akori-dark .option.correct { border-color:#2fa77a!important;background:#12352b!important; }
-body.akori-dark .option.wrong { border-color:#d9687a!important;background:#3a1b25!important; }
-body.akori-dark .quiz-radio-group .wrap > label { background:#1b2438!important;border-color:#2c3957!important;color:#e6ebf7!important; }
-body.akori-dark .quiz-radio-group .wrap > label span { color:#e6ebf7!important; }
-body.akori-dark .quiz-radio-group .wrap > label:hover,
-body.akori-dark .quiz-radio-group .wrap > label:has(input:checked) { background:#232f55!important;border-color:#7b8ff7!important;box-shadow:0 0 0 2px #2a3866; }
-body.akori-dark .quiz-stats b { color:#a8b8ff!important; }
+html:root:root:root:root body.akori-dark .option { border-color:#2c3957!important;background:#1b2438!important; }
+html:root:root:root:root body.akori-dark .option span { background:#27324a!important;color:#c9d2e6!important; }
+html:root:root:root:root body.akori-dark .option.correct { border-color:#2fa77a!important;background:#12352b!important; }
+html:root:root:root:root body.akori-dark .option.wrong { border-color:#d9687a!important;background:#3a1b25!important; }
+html:root:root:root:root body.akori-dark .quiz-radio-group .wrap > label { background:#1b2438!important;border-color:#2c3957!important;color:#e6ebf7!important; }
+html:root:root:root:root body.akori-dark .quiz-radio-group .wrap > label span { color:#e6ebf7!important; }
+html:root:root:root:root body.akori-dark .quiz-radio-group .wrap > label:hover,
+html:root:root:root:root body.akori-dark .quiz-radio-group .wrap > label:has(input:checked) { background:#232f55!important;border-color:#7b8ff7!important;box-shadow:0 0 0 2px #2a3866; }
+html:root:root:root:root body.akori-dark .quiz-stats b { color:#a8b8ff!important; }
 
 /* dossiers / import */
-body.akori-dark .folder-card:hover { border-color:#3b4b7a!important; }
-body.akori-dark .folder-card.active-course { border-color:#7b8ff7!important;box-shadow:0 0 0 2px #1f2a4d; }
-body.akori-dark #add-document-tile .wrap { background:transparent!important; }
+html:root:root:root:root body.akori-dark .folder-card:hover { border-color:#3b4b7a!important; }
+html:root:root:root:root body.akori-dark .folder-card.active-course { border-color:#7b8ff7!important;box-shadow:0 0 0 2px #1f2a4d; }
+html:root:root:root:root body.akori-dark #add-document-tile .wrap { background:transparent!important; }
 
-body.akori-dark #sidebar:hover { box-shadow:0 18px 50px rgba(0,0,0,.55)!important; }
-body.akori-dark #sidebar .navbtn::before { color:inherit; }
+html:root:root:root:root body.akori-dark #sidebar:hover { box-shadow:0 18px 50px rgba(0,0,0,.55)!important; }
+html:root:root:root:root body.akori-dark #sidebar .navbtn::before { color:inherit; }
 
 /* cartes flashcards (iframe) : inversion douce */
-body.akori-dark iframe { filter:invert(.92) hue-rotate(180deg); }
+html:root:root:root:root body.akori-dark iframe { filter:invert(.92) hue-rotate(180deg); }
 
 /* ===== Tuile « Ajouter un document » ===== */
 #add-document-tile, #add-document-tile.gr-button, button#add-document-tile {
@@ -1948,7 +1948,7 @@ body.akori-dark iframe { filter:invert(.92) hue-rotate(180deg); }
 #add-document-tile * { color:#fff!important;-webkit-text-fill-color:#fff!important; }
 
 
-/* ===== Menu latéral : rail d'icônes + ouverture au survol ===== */
+/* ===== Menu latéral : fixe, largeur définie, rail d'icônes + survol ===== */
 #nav-home::before { content:"⌂"; }
 #nav-courses::before { content:"▣"; }
 #nav-review::before { content:"◈"; }
@@ -1961,60 +1961,87 @@ body.akori-dark iframe { filter:invert(.92) hue-rotate(180deg); }
 #nav-history::before { content:"◷"; }
 #nav-settings::before { content:"⚙"; }
 
+/* NB : Gradio recopie chaque règle avec un préfixe ".gradio-container … .contain" qui lui donne
+   plus de poids. Les états (replié / survol) passent donc par des variables CSS. */
+:root { --sb-open:264px; --sb-rail:72px; --sb-left:max(16px, calc((100vw - 1280px)/2 + 32px)); }
+body { --sb-w:var(--sb-open); --main-ml:calc(var(--sb-open) + 16px); }
+body.sidebar-collapsed { --sb-w:var(--sb-rail); --main-ml:calc(var(--sb-rail) + 16px); }
+
+/* mise en page stable : toutes les pages ont la même largeur et la barre de défilement est toujours là */
+html { overflow-y:scroll!important; }
+.gradio-container:has(#main-column), .main:has(#main-column), .wrap:has(#main-column), .contain:has(#main-column),
+.column:has(> .row > #main-column), .row:has(> #main-column) { width:100%!important; }
+.row:has(> #main-column) { flex-wrap:nowrap!important; }
+
 #sidebar {
+  position:fixed!important;top:14px!important;left:var(--sb-left)!important;
+  width:var(--sb-w)!important;min-width:var(--sb-w)!important;max-width:var(--sb-w)!important;flex:none!important;
+  height:calc(100vh - 28px)!important;max-height:calc(100vh - 28px)!important;min-height:0!important;
   display:flex!important;flex-direction:column!important;gap:2px!important;--layout-gap:2px;
-  z-index:60;
-  transition:flex-basis .3s cubic-bezier(.4,0,.2,1), min-width .3s cubic-bezier(.4,0,.2,1),
-             max-width .3s cubic-bezier(.4,0,.2,1), margin .3s cubic-bezier(.4,0,.2,1),
-             padding .3s ease, box-shadow .3s ease;
+  padding-left:var(--sb-pad,16px)!important;padding-right:var(--sb-pad,16px)!important;
+  overflow-x:hidden!important;overflow-y:auto!important;scrollbar-width:thin;
+  box-shadow:var(--sb-shadow, 0 8px 30px rgba(42,55,90,.06))!important;z-index:60;
+  transition:width .3s cubic-bezier(.4,0,.2,1), min-width .3s cubic-bezier(.4,0,.2,1),
+             max-width .3s cubic-bezier(.4,0,.2,1), padding .3s ease, box-shadow .3s ease;
 }
+#main-column {
+  flex:1 1 0!important;min-width:0!important;width:auto!important;
+  margin-left:var(--main-ml)!important;
+  transition:margin-left .3s cubic-bezier(.4,0,.2,1);
+  overflow-wrap:break-word;word-break:normal;
+}
+#main-tabs .tabitem { min-height:calc(100vh - 150px)!important;width:100%!important; }
+
+/* barre du haut : le titre et le sélecteur de cours se replient proprement, sans casser les mots */
+#topbar { flex-wrap:wrap!important;gap:8px 16px!important;align-items:center!important; }
+#topbar > * { flex:1 1 240px!important;min-width:min(240px,100%)!important; }
+#topbar h3 { white-space:normal!important;word-break:normal!important;overflow-wrap:normal!important;margin:0!important; }
+
 #sidebar .block { padding:0!important;margin:0!important;border:0!important;min-height:0!important; }
 #sidebar .navbtn {
-  display:flex!important;align-items:center!important;justify-content:flex-start!important;gap:12px!important;
-  min-height:40px!important;margin:1px 0!important;padding:0 12px!important;white-space:nowrap;overflow:hidden;
+  display:flex!important;align-items:center!important;justify-content:var(--nav-jc, flex-start)!important;gap:var(--nav-gap, 12px)!important;
+  font-size:var(--nav-fs, 13px)!important;min-height:40px!important;margin:1px 0!important;padding:0 var(--nav-px, 12px)!important;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:none!important;
 }
 #sidebar .navbtn::before { display:inline-block;width:24px;flex:none;text-align:center;font-size:17px;line-height:1; }
-#sidebar #nav-settings { margin-top:auto!important;border-top:1px solid var(--ak-line)!important;border-radius:11px!important; }
-#sidebar .sidebar-note { margin-top:8px!important; }
+#sidebar #nav-settings { margin-top:auto!important;border-top:1px solid var(--ak-line)!important; }
 
-/* bouton ☰ placé dans le sidebar */
+/* textes du menu : toujours entiers, jamais coupés */
+#sidebar .brand { margin:2px 4px 14px!important;align-items:center;justify-content:var(--brand-jc, flex-start)!important; }
+#sidebar .brand > div:last-child { min-width:0;display:var(--lab-d, block)!important; }
+#sidebar .brand { width:100%; }
+#sidebar .brand-mark { flex:none!important;width:42px!important;min-width:42px!important;height:42px!important; }
+#sidebar .brand-name { white-space:nowrap; }
+#sidebar .brand-sub { white-space:normal!important;overflow-wrap:normal;word-break:normal;font-size:10px!important;line-height:1.35!important; }
+#sidebar .nav-title { white-space:nowrap;display:var(--lab-d, block)!important; }
+#sidebar .sidebar-note { white-space:normal!important;overflow-wrap:normal;word-break:normal;margin-top:8px!important;font-size:10.5px!important;line-height:1.45!important;display:var(--lab-d, block)!important; }
+
 #sidebar #sidebar-toggle {
-  width:44px!important;min-width:44px!important;max-width:44px!important;height:40px!important;
-  padding:0!important;font-size:20px!important;align-self:flex-start;margin:0 0 6px 2px!important;
+  width:44px!important;min-width:44px!important;max-width:44px!important;height:40px!important;flex:none!important;
+  padding:0!important;font-size:20px!important;align-self:var(--tog-as, flex-start)!important;margin:0 0 6px 2px!important;
   display:flex!important;align-items:center!important;justify-content:center!important;
 }
-#sidebar .brand { margin:2px 4px 14px!important;white-space:nowrap; }
 
-/* état replié : seules les icônes restent visibles */
-body.sidebar-collapsed #sidebar {
-  flex:0 0 72px!important;min-width:72px!important;max-width:72px!important;
-  padding-left:10px!important;padding-right:10px!important;overflow-x:hidden!important;
+/* menu replié : seules les icônes restent visibles ... */
+body.sidebar-collapsed #sidebar:not(:hover) {
+  --sb-pad:10px; --nav-fs:0px; --nav-gap:0px; --nav-px:0px; --nav-jc:center;
+  --lab-d:none; --brand-jc:center; --tog-as:center;
 }
-body.sidebar-collapsed #sidebar:not(:hover) .navbtn { font-size:0!important;justify-content:center!important;gap:0!important;padding:0!important; }
-body.sidebar-collapsed #sidebar:not(:hover) #sidebar-toggle { align-self:center; margin-left:0!important; }
-body.sidebar-collapsed #sidebar:not(:hover) .brand-name,
-body.sidebar-collapsed #sidebar:not(:hover) .brand-sub,
-body.sidebar-collapsed #sidebar:not(:hover) .nav-title,
-body.sidebar-collapsed #sidebar:not(:hover) .sidebar-note { display:none!important; }
-body.sidebar-collapsed #sidebar:not(:hover) .brand { justify-content:center;margin-left:0!important;margin-right:0!important; }
+body.sidebar-collapsed #sidebar:hover { --sb-w:var(--sb-open); --sb-shadow:0 18px 50px rgba(30,41,80,.22); }
 
-/* survol du rail : le menu s'ouvre PAR-DESSUS la page (pas de décalage) puis se referme */
-body.sidebar-collapsed #sidebar:hover {
-  flex-basis:270px!important;min-width:270px!important;max-width:270px!important;margin-right:-198px!important;
-  box-shadow:0 18px 50px rgba(30,41,80,.22)!important;
-}
-
-/* écrans étroits : rail par défaut, ouverture en surimpression */
+/* écrans étroits : rail fixe, ouverture en surimpression */
 @media (max-width:900px) {
-  #sidebar { flex:0 0 72px!important;min-width:72px!important;max-width:72px!important;padding-left:10px!important;padding-right:10px!important; }
-  body:not(.sidebar-collapsed) #sidebar {
-    flex-basis:270px!important;min-width:270px!important;max-width:270px!important;margin-right:-198px!important;
-    box-shadow:0 18px 50px rgba(30,41,80,.22)!important;
-  }
-  .gradio-container { padding:10px!important; }
+  :root { --sb-left:10px; }
+  body { --sb-w:var(--sb-rail); --main-ml:calc(var(--sb-rail) + 12px); }
+  body.sidebar-collapsed { --main-ml:calc(var(--sb-rail) + 12px); }
+  body:not(.sidebar-collapsed) #sidebar { --sb-w:var(--sb-open); --sb-shadow:0 18px 50px rgba(30,41,80,.22); }
+  body.sidebar-collapsed #sidebar:not(:hover), body:not(.sidebar-collapsed) #sidebar { --sb-pad:10px; }
+  body:not(.sidebar-collapsed) #sidebar { --sb-pad:16px; }
+  .gradio-container { padding:6px!important; }
+  .gradio-container .main { padding-left:6px!important;padding-right:6px!important; }
 }
 @media (max-width:600px) {
-  #topbar { flex-wrap:wrap!important; }
+  :root { --sb-rail:60px; --sb-open:240px; }
   .hero { padding:20px!important; }
 }
 
@@ -2022,8 +2049,8 @@ body.sidebar-collapsed #sidebar:hover {
 #theme-choice .wrap { display:flex!important;gap:10px!important; }
 #theme-choice label { flex:1;border:1.5px solid #dfe5ef!important;border-radius:14px!important;padding:14px 18px!important;cursor:pointer;font-weight:650; }
 #theme-choice label:has(input:checked) { border-color:#4f46e5!important;background:#eef2ff!important; }
-body.akori-dark #theme-choice label { border-color:#2c3957!important;background:#1b2438!important;color:#e6ebf7!important; }
-body.akori-dark #theme-choice label:has(input:checked) { border-color:#7b8ff7!important;background:#232f55!important; }
+html:root:root:root:root body.akori-dark #theme-choice label { border-color:#2c3957!important;background:#1b2438!important;color:#e6ebf7!important; }
+html:root:root:root:root body.akori-dark #theme-choice label:has(input:checked) { border-color:#7b8ff7!important;background:#232f55!important; }
 """
 
 
@@ -2050,6 +2077,17 @@ THEME_INIT_JS = r"""
   document.body.classList.toggle('sidebar-collapsed', collapsed);
   if (!window.__akoriSidebarBound) {
     window.__akoriSidebarBound = true;
+    // Le menu est fixe : on l'aligne sur le bord gauche réel de la grille Gradio.
+    const alignSidebar = () => {
+      const main = document.querySelector('#main-column');
+      if (!main || !main.parentElement) return;
+      const left = main.parentElement.getBoundingClientRect().left;
+      document.documentElement.style.setProperty('--sb-left', Math.max(8, Math.round(left)) + 'px');
+    };
+    alignSidebar();
+    window.addEventListener('resize', alignSidebar);
+    setTimeout(alignSidebar, 300);
+    setTimeout(alignSidebar, 1200);
     document.addEventListener('click', (ev) => {
       // Écran étroit : après le choix d'une page, le menu se referme pour libérer l'affichage.
       if (window.innerWidth <= 900 && ev.target.closest('#sidebar .navbtn')) {
@@ -2105,7 +2143,7 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
     with gr.Row(equal_height=False):
         with gr.Column(scale=1, min_width=60, elem_id="sidebar"):
             menu_btn = gr.Button("☰", elem_id="sidebar-toggle")
-            gr.HTML("<div class='brand'><div class='brand-mark'>A</div><div><div class='brand-name'>AKORI</div><div class='brand-sub'>Assistant Knowledge Organized<br>to Revise Intelligently</div></div></div>")
+            gr.HTML("<div class='brand'><div class='brand-mark'>A</div><div><div class='brand-name'>AKORI</div><div class='brand-sub'>Assistant Knowledge Organized to Revise Intelligently</div></div></div>")
             gr.Markdown("**NAVIGATION**", elem_classes="nav-title")
             nav_home = gr.Button("Accueil", elem_id="nav-home", elem_classes="navbtn")
             nav_courses = gr.Button("Mes dossiers", elem_id="nav-courses", elem_classes="navbtn")
