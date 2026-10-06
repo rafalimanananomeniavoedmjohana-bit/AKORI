@@ -1,4 +1,5 @@
 import contextvars
+import traceback
 import secrets
 import hashlib
 import hmac
@@ -424,6 +425,24 @@ def _save_history(filename):
   _write_json(_doc_metadata_path(filename), _doc_metadata(filename, data))
 
 
+class _LazyVectorStore:
+  """Index FAISS d'un cours chargé seulement à la première utilisation (recherche, résumé, quiz…)."""
+
+  def __init__(self, path):
+    self._path = path
+    self._vs = None
+    self._lock = threading.Lock()
+
+  def _load(self):
+    with self._lock:
+      if self._vs is None:
+        self._vs = FAISS.load_local(self._path, embed_model, allow_dangerous_deserialization=True)
+      return self._vs
+
+  def __getattr__(self, name):
+    return getattr(self._load(), name)
+
+
 def _load_user_documents(key):
   docs = {}
   root = _user_docs_dir(key)
@@ -440,7 +459,7 @@ def _load_user_documents(key):
       filename = (metadata or {}).get("filename")
       if not filename:
         continue
-      vector_db = FAISS.load_local(index_path, embed_model, allow_dangerous_deserialization=True)
+      vector_db = _LazyVectorStore(index_path)
       docs[filename] = {
           "vector_db": vector_db,
           "history": metadata.get("history", []),
@@ -698,11 +717,16 @@ def indexer_pdf_stream(file_path):
     yield ("done", None, f"❌ Erreur lors de l'indexation : {str(e)}")
 
 
+UI_CHAT_LIMIT = 30      # messages envoyés au navigateur (le reste reste archivé)
+UI_HISTORY_LIMIT = 80   # messages affichés dans l'onglet Historique
+HISTORY_KEEP = 300      # messages conservés par cours
+
+
 def _chat_history_for_ui(doc_name):
   data = documents_db.get(doc_name, {})
   raw = data.get("history", [])
   result = []
-  for item in raw:
+  for item in raw[-UI_CHAT_LIMIT:]:
     if isinstance(item, dict) and item.get("role") and item.get("content"):
       result.append({"role": item["role"], "content": str(item["content"])})
   return result
@@ -797,6 +821,8 @@ def _ui_chat_user_message(message_utilisateur, history, doc_selectionne):
   historique = documents_db[doc_selectionne]["history"]
   historique.append({"role": "user", "content": message_str})
   historique.append({"role": "assistant", "content": "⏳ Génération…"})
+  if len(historique) > HISTORY_KEEP:
+    del historique[:-HISTORY_KEEP]
 
   # IMPORTANT : aucune sauvegarde FAISS ici.
   return "", _chat_history_for_ui(doc_selectionne), message_str
@@ -1544,9 +1570,10 @@ def history_view(doc_name):
         return "<div class='empty-study'>Aucun historique pour le moment.</div>"
     history = documents_db[doc_name].get("history", [])
     blocks = []
-    for item in history:
+    for item in history[-UI_HISTORY_LIMIT:]:
         role = item.get("role", "")
-        content = _escape_html(item.get("content", ""))
+        raw_content = str(item.get("content", ""))
+        content = _escape_html(raw_content[:2000] + ("…" if len(raw_content) > 2000 else ""))
         cls = "history-user" if role == "user" else "history-ai"
         label = "Vous" if role == "user" else "AKORI"
         blocks.append(f"<div class='{cls}'><b>{label}</b><div>{content}</div></div>")
@@ -2785,6 +2812,11 @@ def _scoped(fn):
         request = args[-1] if args else None
         return args[:-1], SESSIONS.get(getattr(request, "session_hash", None))
 
+    def _report(exc):
+        print(f"⚠️ Erreur dans « {getattr(fn, '__name__', 'action')} » : {exc}")
+        traceback.print_exc()
+        _log("error", detail=f"{getattr(fn, '__name__', 'action')} · {exc}")
+
     if inspect.isgeneratorfunction(fn):
         @functools.wraps(fn)
         def wrapper(*args):
@@ -2796,6 +2828,9 @@ def _scoped(fn):
                     item = next(gen)
                 except StopIteration:
                     return
+                except Exception as exc:
+                    _report(exc)
+                    raise
                 finally:
                     _CUR_USER.reset(tok)
                 yield item
@@ -2806,6 +2841,9 @@ def _scoped(fn):
             tok = _CUR_USER.set(user)
             try:
                 return fn(*real)
+            except Exception as exc:
+                _report(exc)
+                raise
             finally:
                 _CUR_USER.reset(tok)
     wrapper.__signature__ = new_sig
@@ -3463,7 +3501,8 @@ if __name__ == "__main__":
     demo.queue(default_concurrency_limit=4, max_size=64).launch(
         share=True,
         debug=False,
-        show_error=False,
+        show_error=True,
+        head='<meta name="google" content="notranslate"><meta http-equiv="Content-Language" content="fr"><script>document.documentElement.setAttribute("translate","no");document.documentElement.lang="fr";</script>',
         theme=theme_akori,
         css=custom_css,
         js=AKORI_NAV_JS,
