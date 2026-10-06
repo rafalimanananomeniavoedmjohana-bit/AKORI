@@ -1309,7 +1309,6 @@ body, .gradio-container {
 }
 #sidebar .navbtn:focus-visible { outline:2px solid #cbd4ff!important; }
 #sidebar .gr-button { color:inherit!important; }
-#sidebar .sidebar-note { color:#8993a7!important;font-size:10px;line-height:1.45;margin-top:18px; }
 
 /* Import button */
 #sidebar .primary {
@@ -1948,7 +1947,7 @@ html:root:root:root:root body.akori-dark iframe { filter:invert(.92) hue-rotate(
 #add-document-tile * { color:#fff!important;-webkit-text-fill-color:#fff!important; }
 
 
-/* ===== Menu latéral : fixe, largeur définie, rail d'icônes + survol ===== */
+/* ===== Menu latéral : fixe, rail d'icônes, ouverture fluide au survol (sans superposition) ===== */
 #nav-home::before { content:"⌂"; }
 #nav-courses::before { content:"▣"; }
 #nav-review::before { content:"◈"; }
@@ -1961,13 +1960,15 @@ html:root:root:root:root body.akori-dark iframe { filter:invert(.92) hue-rotate(
 #nav-history::before { content:"◷"; }
 #nav-settings::before { content:"⚙"; }
 
-/* NB : Gradio recopie chaque règle avec un préfixe ".gradio-container … .contain" qui lui donne
-   plus de poids. Les états (replié / survol) passent donc par des variables CSS. */
-:root { --sb-open:264px; --sb-rail:72px; --sb-left:max(16px, calc((100vw - 1280px)/2 + 32px)); }
+/* NB : Gradio recopie chaque règle avec un préfixe ".gradio-container … .contain" qui lui donne plus
+   de poids. Les états (replié / survol) passent donc par des variables CSS posées sur <body>. */
+:root { --sb-open:264px; --sb-rail:72px; --sb-left:max(16px, calc((100vw - 1280px)/2 + 32px)); --sb-ease:cubic-bezier(.4,0,.2,1); --sb-dur:.32s; }
 body { --sb-w:var(--sb-open); --main-ml:calc(var(--sb-open) + 16px); }
 body.sidebar-collapsed { --sb-w:var(--sb-rail); --main-ml:calc(var(--sb-rail) + 16px); }
+/* survol du rail : le menu s'ouvre et la page glisse en même temps (même durée, même courbe) */
+body.sidebar-collapsed:has(#sidebar:hover) { --sb-w:var(--sb-open); --main-ml:calc(var(--sb-open) + 16px); }
 
-/* mise en page stable : toutes les pages ont la même largeur et la barre de défilement est toujours là */
+/* mise en page stable : toutes les pages ont la même largeur, barre de défilement toujours présente */
 html { overflow-y:scroll!important; }
 .gradio-container:has(#main-column), .main:has(#main-column), .wrap:has(#main-column), .contain:has(#main-column),
 .column:has(> .row > #main-column), .row:has(> #main-column) { width:100%!important; }
@@ -1978,16 +1979,17 @@ html { overflow-y:scroll!important; }
   width:var(--sb-w)!important;min-width:var(--sb-w)!important;max-width:var(--sb-w)!important;flex:none!important;
   height:calc(100vh - 28px)!important;max-height:calc(100vh - 28px)!important;min-height:0!important;
   display:flex!important;flex-direction:column!important;gap:2px!important;--layout-gap:2px;
-  padding-left:var(--sb-pad,16px)!important;padding-right:var(--sb-pad,16px)!important;
-  overflow-x:hidden!important;overflow-y:auto!important;scrollbar-width:thin;
-  box-shadow:var(--sb-shadow, 0 8px 30px rgba(42,55,90,.06))!important;z-index:60;
-  transition:width .3s cubic-bezier(.4,0,.2,1), min-width .3s cubic-bezier(.4,0,.2,1),
-             max-width .3s cubic-bezier(.4,0,.2,1), padding .3s ease, box-shadow .3s ease;
+  padding-left:12px!important;padding-right:12px!important;
+  overflow-x:hidden!important;overflow-y:auto!important;scrollbar-width:none;
+  box-shadow:0 8px 30px rgba(42,55,90,.06)!important;z-index:60;
+  transition:width var(--sb-dur) var(--sb-ease), min-width var(--sb-dur) var(--sb-ease), max-width var(--sb-dur) var(--sb-ease);
+  will-change:width;
 }
+#sidebar::-webkit-scrollbar { display:none; }
 #main-column {
   flex:1 1 0!important;min-width:0!important;width:auto!important;
   margin-left:var(--main-ml)!important;
-  transition:margin-left .3s cubic-bezier(.4,0,.2,1);
+  transition:margin-left var(--sb-dur) var(--sb-ease);
   overflow-wrap:break-word;word-break:normal;
 }
 #main-tabs .tabitem { min-height:calc(100vh - 150px)!important;width:100%!important; }
@@ -1997,46 +1999,40 @@ html { overflow-y:scroll!important; }
 #topbar > * { flex:1 1 240px!important;min-width:min(240px,100%)!important; }
 #topbar h3 { white-space:normal!important;word-break:normal!important;overflow-wrap:normal!important;margin:0!important; }
 
-#sidebar .block { padding:0!important;margin:0!important;border:0!important;min-height:0!important; }
+/* Contenu du menu : positions constantes, le texte est simplement « découvert » par la largeur qui s'anime */
+#sidebar .block { padding:0!important;margin:0!important;border:0!important;min-height:0!important;flex:none!important; }
 #sidebar .navbtn {
-  display:flex!important;align-items:center!important;justify-content:var(--nav-jc, flex-start)!important;gap:var(--nav-gap, 12px)!important;
-  font-size:var(--nav-fs, 13px)!important;min-height:40px!important;margin:1px 0!important;padding:0 var(--nav-px, 12px)!important;
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:none!important;
+  display:flex!important;align-items:center!important;justify-content:flex-start!important;gap:12px!important;
+  width:100%!important;min-height:40px!important;margin:1px 0!important;padding:0 12px!important;
+  font-size:13px!important;white-space:nowrap!important;overflow:hidden!important;text-overflow:clip!important;flex:none!important;
+  transition:background-color .18s ease, color .18s ease, border-color .18s ease, transform .18s ease!important;
 }
 #sidebar .navbtn::before { display:inline-block;width:24px;flex:none;text-align:center;font-size:17px;line-height:1; }
+#sidebar .navbtn:hover { transform:translateX(2px); }
 #sidebar #nav-settings { margin-top:auto!important;border-top:1px solid var(--ak-line)!important; }
 
-/* textes du menu : toujours entiers, jamais coupés */
-#sidebar .brand { margin:2px 4px 14px!important;align-items:center;justify-content:var(--brand-jc, flex-start)!important; }
-#sidebar .brand > div:last-child { min-width:0;display:var(--lab-d, block)!important; }
-#sidebar .brand { width:100%; }
-#sidebar .brand-mark { flex:none!important;width:42px!important;min-width:42px!important;height:42px!important; }
-#sidebar .brand-name { white-space:nowrap; }
-#sidebar .brand-sub { white-space:normal!important;overflow-wrap:normal;word-break:normal;font-size:10px!important;line-height:1.35!important; }
-#sidebar .nav-title { white-space:nowrap;display:var(--lab-d, block)!important; }
-#sidebar .sidebar-note { white-space:normal!important;overflow-wrap:normal;word-break:normal;margin-top:8px!important;font-size:10.5px!important;line-height:1.45!important;display:var(--lab-d, block)!important; }
-
 #sidebar #sidebar-toggle {
-  width:44px!important;min-width:44px!important;max-width:44px!important;height:40px!important;flex:none!important;
-  padding:0!important;font-size:20px!important;align-self:var(--tog-as, flex-start)!important;margin:0 0 6px 2px!important;
+  width:48px!important;min-width:48px!important;max-width:48px!important;height:40px!important;flex:none!important;
+  padding:0!important;font-size:20px!important;align-self:flex-start!important;margin:0 0 6px 0!important;
   display:flex!important;align-items:center!important;justify-content:center!important;
 }
+#sidebar .html-container, #sidebar .prose { padding:0!important;max-width:none!important; }
+#sidebar .nav-title { transition:opacity .2s ease; }
+body.sidebar-collapsed:not(:has(#sidebar:hover)) #sidebar .nav-title { opacity:0; }
+#sidebar .brand { display:flex!important;align-items:center;gap:11px;width:100%;margin:2px 0 14px!important;padding-left:3px;overflow:hidden;white-space:nowrap; }
+#sidebar .brand-mark { flex:none!important;width:42px!important;min-width:42px!important;height:42px!important; }
+#sidebar .brand > div:last-child { flex:none;width:170px; }
+#sidebar .brand-name { white-space:nowrap; }
+#sidebar .brand-sub { white-space:normal!important;overflow-wrap:normal;word-break:normal;font-size:10px!important;line-height:1.35!important; }
+#sidebar .nav-title { white-space:nowrap;overflow:hidden;padding-left:3px; }
 
-/* menu replié : seules les icônes restent visibles ... */
-body.sidebar-collapsed #sidebar:not(:hover) {
-  --sb-pad:10px; --nav-fs:0px; --nav-gap:0px; --nav-px:0px; --nav-jc:center;
-  --lab-d:none; --brand-jc:center; --tog-as:center;
-}
-body.sidebar-collapsed #sidebar:hover { --sb-w:var(--sb-open); --sb-shadow:0 18px 50px rgba(30,41,80,.22); }
-
-/* écrans étroits : rail fixe, ouverture en surimpression */
+/* écrans étroits : rail fixe, ouverture en surimpression (pas la place de pousser la page) */
 @media (max-width:900px) {
   :root { --sb-left:10px; }
-  body { --sb-w:var(--sb-rail); --main-ml:calc(var(--sb-rail) + 12px); }
-  body.sidebar-collapsed { --main-ml:calc(var(--sb-rail) + 12px); }
-  body:not(.sidebar-collapsed) #sidebar { --sb-w:var(--sb-open); --sb-shadow:0 18px 50px rgba(30,41,80,.22); }
-  body.sidebar-collapsed #sidebar:not(:hover), body:not(.sidebar-collapsed) #sidebar { --sb-pad:10px; }
-  body:not(.sidebar-collapsed) #sidebar { --sb-pad:16px; }
+  body, body.sidebar-collapsed, body.sidebar-collapsed:has(#sidebar:hover) { --sb-w:var(--sb-rail); --main-ml:calc(var(--sb-rail) + 12px); }
+  body:not(.sidebar-collapsed) { --sb-w:var(--sb-open); }
+  body:not(.sidebar-collapsed) #sidebar, body.sidebar-collapsed:has(#sidebar:hover) #sidebar { box-shadow:0 14px 40px rgba(30,41,80,.2)!important; }
+  body.sidebar-collapsed:has(#sidebar:hover) { --sb-w:var(--sb-open); }
   .gradio-container { padding:6px!important; }
   .gradio-container .main { padding-left:6px!important;padding-right:6px!important; }
 }
@@ -2156,7 +2152,6 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
             nav_reviewq = gr.Button("À revoir", elem_id="nav-reviewq", elem_classes="navbtn")
             nav_history = gr.Button("Historique", elem_id="nav-history", elem_classes="navbtn")
             nav_settings = gr.Button("Paramètres", elem_id="nav-settings", elem_classes="navbtn")
-            gr.Markdown("<div class='sidebar-note'>Vos documents, historiques et progressions sont conservés localement dans AKORI.</div>")
 
         with gr.Column(scale=4, min_width=280, elem_id="main-column"):
             with gr.Row(elem_id="topbar"):
