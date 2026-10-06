@@ -1,5 +1,13 @@
+import contextvars
+import secrets
 import hashlib
+import hmac
+import inspect
+import tempfile
 import html
+import shutil
+import zipfile
+from collections.abc import MutableMapping
 import json
 import os
 from datetime import datetime
@@ -57,7 +65,19 @@ def _wait_before_gemini_request():
 embed_model = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2",
     model_kwargs={"device": "cpu"},
+    encode_kwargs={"batch_size": 64},
 )
+
+
+def _warm_up_embeddings():
+  """Charge le modèle d'embeddings en arrière-plan : la 1re question n'attend plus."""
+  try:
+    embed_model.embed_query("warm up")
+  except Exception as e:  # pragma: no cover
+    print(f"⚠️ Préchauffage des embeddings impossible : {e}")
+
+
+threading.Thread(target=_warm_up_embeddings, daemon=True).start()
 
 
 # --- Intentions simples traitées localement (sans appel Gemini) ---
@@ -118,22 +138,244 @@ def _extract_document_title(full_text):
     return lines[0] if lines else ""
 
 
-# --- 2. STOCKAGE PERSISTANT ---
+# --- 2. STOCKAGE PERSISTANT, COMPTES ET DONNÉES PAR UTILISATEUR ---
 DATA_DIR = os.getenv(
     "AKORI_DATA_DIR", os.path.join(os.getcwd(), "akori_data_store")
 )
-DOCUMENTS_DIR = os.path.join(DATA_DIR, "documents")
-os.makedirs(DOCUMENTS_DIR, exist_ok=True)
+USERS_DIR = os.path.join(DATA_DIR, "users")
+LEGACY_DOCUMENTS_DIR = os.path.join(DATA_DIR, "documents")  # ancien stockage mono-utilisateur
+USERS_FILE = os.path.join(DATA_DIR, "users.json")
+TOKENS_FILE = os.path.join(DATA_DIR, "tokens.json")
+ACTIVITY_LOG = os.path.join(DATA_DIR, "activity.log")
+os.makedirs(USERS_DIR, exist_ok=True)
 
-documents_db = {}
+APP_STARTED_AT = time.time()
+TOKEN_TTL_DAYS = 30
+MAX_PDF_MB = float(os.getenv("AKORI_MAX_PDF_MB", "40"))
+
+_CUR_USER = contextvars.ContextVar("akori_user", default=None)  # utilisateur de la requête en cours
+_STORE_LOCK = threading.RLock()
+SESSIONS = {}   # session_hash -> nom d'utilisateur
+_USER_DBS = {}  # nom d'utilisateur -> {nom de fichier: données du cours}
+_LOGIN_FAILS = {}  # nom d'utilisateur -> (échecs, verrouillé jusqu'à)
+
+
+# ---- fichiers JSON (écriture atomique) et journal d'activité ----
+def _read_json(path, default):
+  try:
+    with open(path, "r", encoding="utf-8") as f:
+      return json.load(f)
+  except (OSError, ValueError):
+    return default
+
+
+def _write_json(path, data):
+  os.makedirs(os.path.dirname(path), exist_ok=True)
+  tmp = f"{path}.{os.getpid()}.tmp"
+  with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(data, f, ensure_ascii=False, indent=2)
+  os.replace(tmp, path)
+
+
+def _log(event, user=None, detail=""):
+  """Journal d'activité (une ligne JSON par événement) pour le suivi et la maintenance."""
+  rec = {
+      "t": datetime.now().isoformat(timespec="seconds"),
+      "event": event,
+      "user": user if user is not None else (_CUR_USER.get() or ""),
+      "detail": str(detail)[:300],
+  }
+  try:
+    with _STORE_LOCK, open(ACTIVITY_LOG, "a", encoding="utf-8") as f:
+      f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+  except OSError:
+    pass
+
+
+def _read_log(limit=300):
+  try:
+    with open(ACTIVITY_LOG, "r", encoding="utf-8") as f:
+      lines = f.readlines()[-limit:]
+  except OSError:
+    return []
+  out = []
+  for line in lines:
+    try:
+      out.append(json.loads(line))
+    except ValueError:
+      continue
+  return out[::-1]
+
+
+# ---- comptes ----
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
+
+
+def _hash_password(password, salt=None):
+  salt = salt or secrets.token_hex(16)
+  digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), 200_000).hex()
+  return salt, digest
+
+
+def _users():
+  return _read_json(USERS_FILE, {})
+
+
+def _create_user(username, password, role="user"):
+  """Retourne (ok, message). Les messages sont en français : l'interface les traduit."""
+  username = str(username or "").strip()
+  password = str(password or "")
+  if not USERNAME_RE.match(username):
+    return False, "⚠️ Nom d'utilisateur invalide (3 à 32 caractères : lettres, chiffres, . _ -)."
+  if len(password) < 6:
+    return False, "⚠️ Mot de passe trop court (6 caractères minimum)."
+  key = username.lower()
+  with _STORE_LOCK:
+    users = _users()
+    if key in users:
+      return False, "⚠️ Ce nom d'utilisateur existe déjà."
+    salt, digest = _hash_password(password)
+    users[key] = {
+        "username": username, "salt": salt, "hash": digest, "role": role, "active": True,
+        "created_at": datetime.now().isoformat(timespec="seconds"), "last_login": "", "logins": 0,
+    }
+    _write_json(USERS_FILE, users)
+  os.makedirs(_user_docs_dir(key), exist_ok=True)
+  _log("register", key, f"rôle={role}")
+  return True, "✅ Compte créé."
+
+
+def _authenticate(username, password):
+  """Retourne (clé_utilisateur | None, message)."""
+  key = str(username or "").strip().lower()
+  fails, locked_until = _LOGIN_FAILS.get(key, (0, 0))
+  if locked_until > time.time():
+    return None, "⏳ Trop de tentatives. Réessayez dans une minute."
+  user = _users().get(key)
+  ok = False
+  if user:
+    _, digest = _hash_password(str(password or ""), user["salt"])
+    ok = hmac.compare_digest(digest, user["hash"])
+  if not ok:
+    fails += 1
+    _LOGIN_FAILS[key] = (fails, time.time() + 60 if fails >= 5 else 0)
+    _log("login_fail", key)
+    return None, "⚠️ Identifiants incorrects."
+  if not user.get("active", True):
+    _log("login_blocked", key)
+    return None, "⛔ Ce compte est désactivé. Contactez l'administrateur."
+  _LOGIN_FAILS.pop(key, None)
+  with _STORE_LOCK:
+    users = _users()
+    users[key]["last_login"] = datetime.now().isoformat(timespec="seconds")
+    users[key]["logins"] = int(users[key].get("logins", 0)) + 1
+    _write_json(USERS_FILE, users)
+  _log("login", key)
+  return key, ""
+
+
+def _user_role(key):
+  return (_users().get(key) or {}).get("role", "user")
+
+
+def _is_admin(key=None):
+  key = key or _CUR_USER.get()
+  return bool(key) and _user_role(key) == "admin"
+
+
+# ---- jetons de reconnexion automatique (« rester connecté ») ----
+def _token_hash(token):
+  return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _issue_token(key):
+  token = secrets.token_urlsafe(32)
+  with _STORE_LOCK:
+    tokens = _read_json(TOKENS_FILE, {})
+    now = time.time()
+    tokens = {h: t for h, t in tokens.items() if t.get("exp", 0) > now}
+    tokens[_token_hash(token)] = {"user": key, "exp": now + TOKEN_TTL_DAYS * 86400}
+    _write_json(TOKENS_FILE, tokens)
+  return token
+
+
+def _user_from_token(token):
+  if not token:
+    return None
+  rec = _read_json(TOKENS_FILE, {}).get(_token_hash(str(token)))
+  if not rec or rec.get("exp", 0) < time.time():
+    return None
+  user = _users().get(rec["user"])
+  return rec["user"] if user and user.get("active", True) else None
+
+
+def _revoke_token(token):
+  if not token:
+    return
+  with _STORE_LOCK:
+    tokens = _read_json(TOKENS_FILE, {})
+    if tokens.pop(_token_hash(str(token)), None) is not None:
+      _write_json(TOKENS_FILE, tokens)
+
+
+def _revoke_user_tokens(key):
+  with _STORE_LOCK:
+    tokens = _read_json(TOKENS_FILE, {})
+    kept = {h: t for h, t in tokens.items() if t.get("user") != key}
+    if len(kept) != len(tokens):
+      _write_json(TOKENS_FILE, kept)
+
+
+# ---- données par utilisateur ----
+def _user_docs_dir(key):
+  return os.path.join(USERS_DIR, key, "documents")
+
+
+def _bootstrap_admin():
+  """Crée le compte administrateur au premier lancement et migre l'ancien stockage."""
+  users = _users()
+  if not any(u.get("role") == "admin" for u in users.values()):
+    name = os.getenv("AKORI_ADMIN_USER", "admin")
+    password = os.getenv("AKORI_ADMIN_PASSWORD")
+    generated = not password
+    if generated:
+      password = secrets.token_urlsafe(9)
+    ok, msg = _create_user(name, password, role="admin")
+    if ok and generated:
+      path = os.path.join(DATA_DIR, "ADMIN_INITIAL_PASSWORD.txt")
+      with open(path, "w", encoding="utf-8") as f:
+        f.write(f"Compte administrateur AKORI\nIdentifiant : {name}\nMot de passe : {password}\n"
+                "Changez-le dès la première connexion, puis supprimez ce fichier.\n")
+      print("=" * 64)
+      print(f"🛡  AKORI — compte administrateur créé : {name} / {password}")
+      print(f"    (aussi enregistré dans {path})")
+      print("=" * 64)
+    users = _users()
+  admin_key = next((k for k, u in users.items() if u.get("role") == "admin"), None)
+  # Anciens cours (stockage unique) -> rattachés à l'administrateur, rien n'est perdu.
+  if admin_key and os.path.isdir(LEGACY_DOCUMENTS_DIR) and os.listdir(LEGACY_DOCUMENTS_DIR):
+    target = _user_docs_dir(admin_key)
+    os.makedirs(target, exist_ok=True)
+    for entry in os.listdir(LEGACY_DOCUMENTS_DIR):
+      dst = os.path.join(target, entry)
+      if not os.path.exists(dst):
+        shutil.move(os.path.join(LEGACY_DOCUMENTS_DIR, entry), dst)
+    print(f"📦 Anciens documents migrés vers le compte « {admin_key} ».")
 
 
 def _doc_id_from_filename(filename):
   return hashlib.sha256(filename.encode("utf-8")).hexdigest()[:16]
 
 
+def _require_user():
+  key = _CUR_USER.get()
+  if not key:
+    raise PermissionError("Connexion requise.")
+  return key
+
+
 def _doc_folder(filename):
-  return os.path.join(DOCUMENTS_DIR, _doc_id_from_filename(filename))
+  return os.path.join(_user_docs_dir(_require_user()), _doc_id_from_filename(filename))
 
 
 def _doc_metadata_path(filename):
@@ -142,107 +384,133 @@ def _doc_metadata_path(filename):
 
 def _doc_index_path(filename):
   return os.path.join(_doc_folder(filename), "faiss_index")
+
+
 def clean_latex_artifacts(text: str) -> str:
     """Nettoie ou convertit les artefacts LaTeX bruts pour un affichage lisible."""
-    # Exemple : transformer les \text{...} en texte simple ou harmoniser les délimiteurs
     text = re.sub(r'\\text\{([^}]+)\}', r'\1', text)
-    # Vous pouvez aussi nettoyer les symboles superflus si besoin
     return text
 
 
-def _save_document(filename):
-  data = documents_db.get(filename)
-  if not data:
-    return
-
-  folder = _doc_folder(filename)
-  os.makedirs(folder, exist_ok=True)
-
-  data["vector_db"].save_local(_doc_index_path(filename))
-
-  metadata = {
+def _doc_metadata(filename, data):
+  return {
       "filename": filename,
       "title": data.get("title", ""),
       "chunks_count": int(data.get("chunks_count", 0)),
       "file_size": int(data.get("file_size", 0)),
+      "content_hash": data.get("content_hash", ""),
       "added_at": data.get("added_at", ""),
       "history": data.get("history", []),
       "progress": data.get("progress", {"flashcards": {}, "quiz_attempts": []}),
   }
 
-  with open(_doc_metadata_path(filename), "w", encoding="utf-8") as f:
-    json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+def _save_document(filename):
+  """Sauvegarde complète (index FAISS + métadonnées)."""
+  data = documents_db.get(filename)
+  if not data:
+    return
+  os.makedirs(_doc_folder(filename), exist_ok=True)
+  data["vector_db"].save_local(_doc_index_path(filename))
+  _write_json(_doc_metadata_path(filename), _doc_metadata(filename, data))
 
 
 def _save_history(filename):
-  """Sauvegarde uniquement l'historique JSON, sans réécrire l'index FAISS."""
+  """Sauvegarde uniquement les métadonnées JSON, sans réécrire l'index FAISS."""
   data = documents_db.get(filename)
   if not data:
     return
-
-  folder = _doc_folder(filename)
-  os.makedirs(folder, exist_ok=True)
-
-  metadata = {
-      "filename": filename,
-      "title": data.get("title", ""),
-      "chunks_count": int(data.get("chunks_count", 0)),
-      "file_size": int(data.get("file_size", 0)),
-      "added_at": data.get("added_at", ""),
-      "history": data.get("history", []),
-      "progress": data.get("progress", {"flashcards": {}, "quiz_attempts": []}),
-  }
-
-  with open(_doc_metadata_path(filename), "w", encoding="utf-8") as f:
-    json.dump(metadata, f, ensure_ascii=False, indent=2)
+  os.makedirs(_doc_folder(filename), exist_ok=True)
+  _write_json(_doc_metadata_path(filename), _doc_metadata(filename, data))
 
 
-def _load_persisted_documents():
-  documents_db.clear()
-  if not os.path.exists(DOCUMENTS_DIR):
-    return
-
-  for entry in os.listdir(DOCUMENTS_DIR):
-    folder = os.path.join(DOCUMENTS_DIR, entry)
-    if not os.path.isdir(folder):
-      continue
-
+def _load_user_documents(key):
+  docs = {}
+  root = _user_docs_dir(key)
+  if not os.path.isdir(root):
+    return docs
+  for entry in sorted(os.listdir(root)):
+    folder = os.path.join(root, entry)
     metadata_path = os.path.join(folder, "metadata.json")
     index_path = os.path.join(folder, "faiss_index")
-
-    if not os.path.exists(metadata_path):
+    if not os.path.isdir(folder) or not os.path.exists(metadata_path) or not os.path.exists(index_path):
       continue
-
     try:
-      with open(metadata_path, "r", encoding="utf-8") as f:
-        metadata = json.load(f)
-
-      filename = metadata.get("filename")
-      if not filename or not os.path.exists(index_path):
+      metadata = _read_json(metadata_path, None)
+      filename = (metadata or {}).get("filename")
+      if not filename:
         continue
-
-      vector_db = FAISS.load_local(
-          index_path,
-          embed_model,
-          allow_dangerous_deserialization=True,
-      )
-
-      documents_db[filename] = {
+      vector_db = FAISS.load_local(index_path, embed_model, allow_dangerous_deserialization=True)
+      docs[filename] = {
           "vector_db": vector_db,
           "history": metadata.get("history", []),
           "chunks_count": int(metadata.get("chunks_count", 0)),
           "full_text": "",
           "title": metadata.get("title", ""),
           "file_size": int(metadata.get("file_size", 0)),
+          "content_hash": metadata.get("content_hash", ""),
           "added_at": metadata.get("added_at", ""),
           "progress": metadata.get("progress", {"flashcards": {}, "quiz_attempts": []}),
       }
     except Exception as e:
-      print(f"⚠️ Impossible de restaurer '{entry}': {e}")
+      print(f"⚠️ Impossible de restaurer '{entry}' ({key}) : {e}")
+  return dict(sorted(docs.items(), key=lambda kv: kv[1].get("added_at", "")))
 
 
-_load_persisted_documents()
+def _db_for(key):
+  if not key:
+    return {}
+  with _STORE_LOCK:
+    if key not in _USER_DBS:
+      _USER_DBS[key] = _load_user_documents(key)
+    return _USER_DBS[key]
 
+
+class _UserDocs(MutableMapping):
+  """Dictionnaire des cours de l'utilisateur de la requête en cours (isolation entre comptes)."""
+
+  def _d(self, write=False):
+    key = _CUR_USER.get()
+    if write and not key:
+      raise PermissionError("Connexion requise.")
+    return _db_for(key)
+
+  def __getitem__(self, k):
+    return self._d()[k]
+
+  def __setitem__(self, k, v):
+    self._d(True)[k] = v
+
+  def __delitem__(self, k):
+    del self._d(True)[k]
+
+  def __iter__(self):
+    return iter(list(self._d()))
+
+  def __len__(self):
+    return len(self._d())
+
+
+documents_db = _UserDocs()
+
+
+def _dir_size(path):
+  total = 0
+  for dp, _, files in os.walk(path):
+    for f in files:
+      try:
+        total += os.path.getsize(os.path.join(dp, f))
+      except OSError:
+        pass
+  return total
+
+
+def _delete_user_data(key):
+  _USER_DBS.pop(key, None)
+  shutil.rmtree(os.path.join(USERS_DIR, key), ignore_errors=True)
+
+
+_bootstrap_admin()
 
 
 # --- Progression réelle, persistante et calculée uniquement à partir des interactions ---
@@ -312,7 +580,7 @@ def _global_progress_stats():
 
 def global_progress_html(active_doc=None):
   if not documents_db:
-    return """<div class='progress-empty'><b>Votre progression commencera ici.</b><br>Importez un cours pour créer votre premier suivi. Tant qu'aucun cours n'est chargé, la progression reste à <b>0 %</b>.</div>"""
+    return """<div class='progress-empty'><b>Votre progression commencera ici.</b><br>Importez un cours pour créer votre premier suivi. Tant qu'aucun cours n'est chargé, la progression reste à 0 %.</div>"""
   st = _global_progress_stats(); rows=[]
   for name,data in documents_db.items():
     cp=_course_progress_percent(name); active=" active-progress-course" if name==active_doc else ""
@@ -363,75 +631,71 @@ def progress_detail_html(active_doc=None):
   """
 
 # --- 3. INDEXATION & UTILITAIRES ---
-def ajouter_et_indexer_pdf(file_path):
+def _file_sha256(path):
+  h = hashlib.sha256()
+  with open(path, "rb") as f:
+    for block in iter(lambda: f.read(1024 * 1024), b""):
+      h.update(block)
+  return h.hexdigest()
+
+
+def indexer_pdf_stream(file_path):
+  """Importe un PDF par étapes. Produit ("status", texte) puis ("done", nom_du_fichier | None, texte)."""
   if not file_path:
-    return (
-        "⚠️ Aucun fichier sélectionné.",
-        gr.update(choices=list(documents_db.keys())),
-        generer_html_documents(),
-    )
+    yield ("done", None, "⚠️ Aucun fichier sélectionné.")
+    return
 
   filename = os.path.basename(file_path)
-
   try:
+    size = os.path.getsize(file_path)
+    if size > MAX_PDF_MB * 1024 * 1024:
+      yield ("done", None, f"⚠️ Fichier trop volumineux (maximum {int(MAX_PDF_MB)} Mo).")
+      return
+
+    content_hash = _file_sha256(file_path)
+    previous = documents_db.get(filename)
+    if previous and previous.get("content_hash") == content_hash:
+      # Même fichier déjà indexé : on réutilise tout, c'est instantané.
+      yield ("done", filename, f"✅ '{filename}' est déjà indexé : réutilisé instantanément.")
+      return
+
+    yield ("status", "⏳ Extraction du texte…")
     with fitz.open(file_path) as doc:
       texte_complet = "".join(page.get_text() for page in doc)
+    if not texte_complet.strip():
+      yield ("done", None, "⚠️ Aucun texte exploitable dans ce PDF (document scanné ?).")
+      return
 
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=800, chunk_overlap=80
-    )
-    chunks = text_splitter.split_text(texte_complet)
+    chunks = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=80).split_text(texte_complet)
+    total = len(chunks)
+    yield ("status", f"⏳ Indexation 0/{total}…")
 
-    vector_db = FAISS.from_texts(chunks, embed_model)
+    vectors = []
+    batch = 64
+    for i in range(0, total, batch):
+      vectors.extend(embed_model.embed_documents(chunks[i:i + batch]))
+      yield ("status", f"⏳ Indexation {min(i + batch, total)}/{total}…")
+    vector_db = FAISS.from_embeddings(list(zip(chunks, vectors)), embed_model)
 
-    previous = documents_db.get(filename, {})
-    same_content = previous.get("file_size") == os.path.getsize(file_path) and previous.get("chunks_count") == len(chunks)
+    same_name = previous is not None
     documents_db[filename] = {
         "vector_db": vector_db,
-        "history": previous.get("history", []) if same_content else [],
-        "progress": previous.get("progress", _default_progress()) if same_content else _default_progress(),
-        "chunks_count": len(chunks),
-        "full_text": texte_complet,
+        "history": [],
+        "progress": _default_progress(),
+        "chunks_count": total,
+        "full_text": "",
         "title": _extract_document_title(texte_complet),
-        "file_size": os.path.getsize(file_path),
-        "added_at": previous.get("added_at") if same_content and previous.get("added_at") else datetime.now().isoformat(timespec="seconds"),
+        "file_size": size,
+        "content_hash": content_hash,
+        "added_at": (previous or {}).get("added_at") if same_name and (previous or {}).get("added_at") else datetime.now().isoformat(timespec="seconds"),
     }
-
+    yield ("status", "⏳ Enregistrement…")
     _save_document(filename)
-    docs_list = list(documents_db.keys())
-
-    return (
-        f"✅ '{filename}' indexé avec succès ({len(chunks)} fragments).",
-        gr.update(choices=docs_list, value=filename),
-        generer_html_documents(),
-    )
+    _log("upload", detail=f"{filename} · {total} fragments · {size // 1024} Ko")
+    yield ("done", filename, f"✅ '{filename}' indexé avec succès ({total} fragments).")
   except Exception as e:
-    return (
-        f"❌ Erreur lors de l'indexation : {str(e)}",
-        gr.update(choices=list(documents_db.keys())),
-        generer_html_documents(),
-    )
-
-
-def generer_html_documents():
-  if not documents_db:
-    return (
-        "<p style='color: #94a3b8;'>Aucun document chargé pour le moment.</p>"
-    )
-
-  html = "<div style='display: flex; flex-direction: column; gap: 10px;'>"
-  for name, data in documents_db.items():
-    html += f"""
-        <div style='background-color: #161e2e; padding: 12px 16px; border-radius: 8px; border: 1px solid #243046; display: flex; justify-content: space-between; align-items: center;'>
-            <div>
-                <b style='color: #f8fafc;'>📄 {name}</b><br>
-                <small style='color: #94a3b8;'>PDF • {data['chunks_count']} fragments indexés</small>
-            </div>
-            <span style='background-color: #334155; color: #cbd5e1; padding: 3px 8px; border-radius: 12px; font-size: 12px;'>Indexé</span>
-        </div>
-        """
-  html += "</div>"
-  return html
+    _log("upload_error", detail=f"{filename} · {e}")
+    yield ("done", None, f"❌ Erreur lors de l'indexation : {str(e)}")
 
 
 def _chat_history_for_ui(doc_name):
@@ -474,40 +738,41 @@ def _estimate_tokens(text_value):
   return max(1, len(str(text_value or "")) // 4)
 
 
-def _appel_gemini_securise(user_prompt, system_instruction, max_retries=2):
-  """Exécute l'appel Gemini avec tentative automatique en cas d'erreur 503/429.
-
-  Bascule sur le modèle de secours si nécessaire.
-  """
-  models_to_try = _models_chain()
-
-  for model_target in models_to_try:
-    for attempt in range(max_retries):
+def _stream_gemini(user_prompt, system_instruction, throttle=False):
+  """Flux de texte Gemini. Réessaie / bascule de modèle tant qu'aucun mot n'a été reçu."""
+  last_error = None
+  for model_target in _models_chain():
+    for attempt in range(2):
+      started = False
       try:
-        _wait_before_gemini_request()
-        return client.models.generate_content_stream(
+        if throttle:
+          _wait_before_gemini_request()
+        stream = client.models.generate_content_stream(
             model=model_target,
             contents=user_prompt,
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
-                max_output_tokens=500,
+                max_output_tokens=1200,
             ),
         )
+        for chunk in stream:
+          text = getattr(chunk, "text", "") or ""
+          if text:
+            started = True
+            yield text
+        return
       except APIError as e:
-        if e.code in [503, 429]:
-          sleep_time = (1.5**attempt) + random.uniform(0.2, 0.6)
-          print(
-              f"⚠️ Modèle {model_target} saturé ({e.code}). Tentative"
-              f" {attempt+1}/{max_retries} dans {sleep_time:.1f}s..."
-          )
-          time.sleep(sleep_time)
-        else:
-          raise e
-
-  raise Exception(
-      "Tous les modèles Gemini sont actuellement saturés. Veuillez réessayer"
-      " dans 10 secondes."
-  )
+        last_error = e
+        if started:
+          raise
+        if e.code in (429, 500, 503, 504) and attempt == 0:
+          time.sleep(0.8 + random.uniform(0.0, 0.4))
+          continue
+        if e.code in (404, 429, 500, 503, 504):
+          break
+        raise
+  _log("gemini_overloaded", detail=getattr(last_error, "code", ""))
+  raise RuntimeError("Gemini est très sollicité en ce moment. Réessayez dans une dizaine de secondes.")
 
 
 def _ui_chat_user_message(message_utilisateur, history, doc_selectionne):
@@ -537,7 +802,7 @@ def _ui_chat_user_message(message_utilisateur, history, doc_selectionne):
   return "", _chat_history_for_ui(doc_selectionne), message_str
 
 
-def repondre_akori_chat_stream(message_str, doc_selectionne, lang=None):
+def repondre_akori_chat_stream(message_str, doc_selectionne):
   """Étape lourde : retrieval + Gemini streaming, sans réécrire FAISS."""
   if not message_str:
     yield _chat_history_for_ui(doc_selectionne), ""
@@ -559,10 +824,17 @@ def repondre_akori_chat_stream(message_str, doc_selectionne, lang=None):
     # Requête locale : pas d'appel Gemini pour une question de titre simple.
     if _is_title_query(message_str):
       title = doc_data.get("title", "").strip()
-      historique[-1]["content"] = (
-          f"Le titre du document est : **{title}**"
-          if title else "⚠️ Le titre du document est indisponible."
-      )
+      english = _normalize_query(message_str) in {"title", "the title", "what is the title", "what s the title"}
+      if title:
+        historique[-1]["content"] = (
+            f"The title of the document is: **{title}**" if english
+            else f"Le titre du document est : **{title}**"
+        )
+      else:
+        historique[-1]["content"] = (
+            "⚠️ The document title is unavailable." if english
+            else "⚠️ Le titre du document est indisponible."
+        )
       _save_history(doc_selectionne)
       yield _chat_history_for_ui(doc_selectionne), ""
       return
@@ -589,16 +861,25 @@ def repondre_akori_chat_stream(message_str, doc_selectionne, lang=None):
         "en t'appuyant STRICTEMENT sur le contexte fourni. "
         "Si une information n'est pas présente dans le contexte, indique-le "
         "plutôt que de l'inventer. "
-        "Pour les formules, utilise un format lisible compatible Markdown/LaTeX."
+        "Pour les formules, utilise un format lisible compatible Markdown/LaTeX. "
+        "LANGUE : réponds TOUJOURS dans la langue utilisée par l'utilisateur dans sa "
+        "dernière question (français, English, etc.), même si le contexte du cours est "
+        "rédigé dans une autre langue."
+    )
+    # Les deux derniers échanges permettent de comprendre les questions de suivi.
+    recent = [
+        m for m in historique[:-2]
+        if m.get("content") and not str(m["content"]).startswith(("⏳", "⚠️"))
+    ][-4:]
+    recent_txt = "\n".join(
+        f"{'Utilisateur' if m['role'] == 'user' else 'AKORI'} : {str(m['content'])[:600]}" for m in recent
     )
     user_prompt = (
-        f"CONTEXTE:\n{contexte_brut}\n\nDEMANDE UTILISATEUR:\n{message_str}"
+        f"CONTEXTE:\n{contexte_brut}\n\n"
+        + (f"ÉCHANGES PRÉCÉDENTS:\n{recent_txt}\n\n" if recent_txt else "")
+        + f"DEMANDE UTILISATEUR:\n{message_str}"
     )
     input_tokens_est = _estimate_tokens(user_prompt)
-
-    stream_response = _appel_gemini_securise(
-        user_prompt, _with_lang(system_instruction, lang)
-    )
     session_usage["input_tokens"] += input_tokens_est
 
     # Streaming visuel lissé : Gemini envoie des fragments de tailles variables.
@@ -610,11 +891,7 @@ def repondre_akori_chat_stream(message_str, doc_selectionne, lang=None):
     MIN_STREAM_CHARS = 10
     MAX_STREAM_DELAY = 0.05
 
-    for chunk in stream_response:
-      texte_chunk = getattr(chunk, "text", "") or ""
-      if not texte_chunk:
-        continue
-
+    for texte_chunk in _stream_gemini(user_prompt, system_instruction):
       reponse += texte_chunk
       buffer += texte_chunk
       now = time.monotonic()
@@ -631,11 +908,13 @@ def repondre_akori_chat_stream(message_str, doc_selectionne, lang=None):
     session_usage["output_tokens"] += _estimate_tokens(reponse)
     session_usage["requests"] += 1
     _save_history(doc_selectionne)
+    _log("chat", detail=f"{doc_selectionne} · {len(reponse)} car.")
 
     # Dernier état garanti après la fin du flux.
     yield _chat_history_for_ui(doc_selectionne), ""
 
   except Exception as e:
+    _log("error", detail=f"chat · {e}")
     historique[-1]["content"] = f"⚠️ {str(e)}"
     _save_history(doc_selectionne)
     yield _chat_history_for_ui(doc_selectionne), ""
@@ -647,25 +926,17 @@ def repondre_akori_chat_stream(message_str, doc_selectionne, lang=None):
 TOKEN_SESSION_LIMIT = 50000
 
 
-LANG_CHOICES = ["Français", "English", "Malagasy"]
+LANG_CHOICES = ["Français", "English"]
 
 
 def _lang_code(label):
-    label = str(label or "")
-    if "English" in label:
-        return "en"
-    if "Malagasy" in label:
-        return "mg"
-    return "fr"
+    return "en" if "English" in str(label or "") else "fr"
 
 
 def _with_lang(system_instruction, lang):
-    """Ajoute la langue de réponse choisie dans les paramètres."""
-    code = _lang_code(lang)
-    if code == "en":
+    """Ajoute la langue de réponse choisie dans les paramètres (résumé, flashcards, quiz)."""
+    if _lang_code(lang) == "en":
         return system_instruction + " IMPORTANT: write the whole answer in English."
-    if code == "mg":
-        return system_instruction + " IMPORTANT: soraty amin'ny teny Malagasy ny valiny rehetra (write the whole answer in Malagasy)."
     return system_instruction
 
 
@@ -861,6 +1132,7 @@ def _gemini_structured(prompt, system_instruction, max_tokens=900):
         raise RuntimeError(
             "Quota ou limite temporaire Gemini atteinte. Attendez un peu avant de relancer la génération."
         ) from last_error
+    _log("gemini_overloaded", detail=getattr(last_error, "code", ""))
     raise RuntimeError(
         "Gemini est très sollicité en ce moment. Réessayez dans une dizaine de secondes."
     ) from last_error
@@ -926,8 +1198,21 @@ def flashcard_statistics(cards, results):
             "mastery": round(known / total * 100) if total else 0}
 
 
-def flashcard_view(cards, index=0, revealed=False, doc_name=None, results=None):
+_FC_TEXT = {
+    "fr": {"card": "🎯 CARTE", "running": "🎰 Roulette active", "stop_hint": "Cliquez sur la carte pour l'arrêter.",
+           "stopped": "⏸ Roulette arrêtée", "show_hint": "Cliquez sur le bouton pour afficher la réponse.",
+           "next_hint": "Passez à la carte suivante.", "answer": "💡 Réponse :",
+           "click_btn": "Cliquez sur le bouton « Afficher la réponse »."},
+    "en": {"card": "🎯 CARD", "running": "🎰 Roulette running", "stop_hint": "Click the card to stop it.",
+           "stopped": "⏸ Roulette stopped", "show_hint": "Click the button to show the answer.",
+           "next_hint": "Go to the next card.", "answer": "💡 Answer:",
+           "click_btn": "Click the “Show the answer” button."},
+}
+
+
+def flashcard_view(cards, index=0, revealed=False, doc_name=None, results=None, lang=None):
     cards = normalize_flashcards(cards)
+    t = _FC_TEXT[_lang_code(lang)]
     if not cards:
         return "<div class='empty-study'>🧠<br><b>Aucune flashcard générée.</b><br>Choisissez un cours puis cliquez sur « Générer les flashcards ».</div>"
 
@@ -944,9 +1229,9 @@ def flashcard_view(cards, index=0, revealed=False, doc_name=None, results=None):
     cards_json = json.dumps(cards, ensure_ascii=True).replace("</", "<\\/")
 
     if revealed:
-        answer_html = f"<div style='margin-top:20px;padding:15px;background:#eef2ff;border-radius:12px;border-left:4px solid #4f46e5;color:#1e293b;'><b>💡 Réponse :</b><br><br>{answer}</div>"
+        answer_html = f"<div style='margin-top:20px;padding:15px;background:#eef2ff;border-radius:12px;border-left:4px solid #4f46e5;color:#1e293b;'><b>{t['answer']}</b><br><br>{answer}</div>"
     else:
-        answer_html = "<div style='margin-top:20px;text-align:center;color:#94a3b8;'>Cliquez sur le bouton <b>« Afficher la réponse »</b>.</div>"
+        answer_html = f"<div style='margin-top:20px;text-align:center;color:#94a3b8;'>{t['click_btn']}</div>"
 
     html_body = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>
 body {{ font-family:'Segoe UI',system-ui,sans-serif;margin:0;padding:10px;overflow:hidden; }}
@@ -958,11 +1243,11 @@ body {{ font-family:'Segoe UI',system-ui,sans-serif;margin:0;padding:10px;overfl
 .hint {{ margin-top:20px;color:#94a3b8;font-size:12px;text-align:center; }}
 </style></head><body>
 <div class="card" onclick="toggle()">
-  <div class="badge">🎯 CARTE {index + 1} / {total}</div>
-  <div id="status" class="status">🎰 Roulette active</div>
+  <div class="badge">{t['card']} {index + 1} / {total}</div>
+  <div id="status" class="status">{t['running']}</div>
   <div id="question" class="q-text">{question}</div>
   <div style="width:100%;">{answer_html}</div>
-  <div id="hint" class="hint">Cliquez sur la carte pour l'arrêter.</div>
+  <div id="hint" class="hint">{t['stop_hint']}</div>
 </div>
 <script>
 const cards = {cards_json};
@@ -976,17 +1261,17 @@ const hintEl = document.getElementById("hint");
 function start() {{
   if (isRevealed || cards.length <= 1) return;
   running = true;
-  statusEl.innerText = "🎰 Roulette active";
+  statusEl.innerText = {json.dumps(t["running"], ensure_ascii=False)};
   statusEl.style.background = "#fef3c7"; statusEl.style.color = "#b45309";
-  hintEl.innerText = "Cliquez sur la carte pour l'arrêter.";
+  hintEl.innerText = {json.dumps(t["stop_hint"], ensure_ascii=False)};
   timer = setInterval(() => {{ qEl.innerText = cards[Math.floor(Math.random() * cards.length)].question; }}, 120);
 }}
 function stop() {{
   running = false;
   if (timer) clearInterval(timer);
-  statusEl.innerText = "⏸ Roulette arrêtée";
+  statusEl.innerText = {json.dumps(t["stopped"], ensure_ascii=False)};
   statusEl.style.background = "#dcfce7"; statusEl.style.color = "#15803d";
-  hintEl.innerText = isRevealed ? "Passez à la carte suivante." : "Cliquez sur le bouton pour afficher la réponse.";
+  hintEl.innerText = isRevealed ? {json.dumps(t["next_hint"], ensure_ascii=False)} : {json.dumps(t["show_hint"], ensure_ascii=False)};
   qEl.innerText = cards[realIndex].question;
 }}
 window.toggle = function() {{ if (isRevealed) return; running ? stop() : start(); }};
@@ -1047,14 +1332,15 @@ Retourne UNIQUEMENT un JSON valide avec la structure exacte suivante :
             f"⚠️ Seulement {len(cards)} flashcard(s) obtenue(s) : il en faut au moins {MIN_FLASHCARDS}. Relancez la génération.")
 
     document["flashcards"] = cards
-    view = flashcard_view(cards, 0, False, doc_name, get_flashcard_results(doc_name, cards))
+    _log("flashcards", detail=f"{doc_name} · {len(cards)}")
+    view = flashcard_view(cards, 0, False, doc_name, get_flashcard_results(doc_name, cards), lang)
     return (cards, 0, False, view, f"✅ {len(cards)} flashcards prêtes !",
             gr.update(visible=True), gr.update(value=GENERATE_LABEL))
 
 
-def flashcard_reveal_handler(cards, index, doc_name):
+def flashcard_reveal_handler(cards, index, doc_name, lang=None):
     cards = normalize_flashcards(cards)
-    return True, flashcard_view(cards, index, True, doc_name, get_flashcard_results(doc_name, cards))
+    return True, flashcard_view(cards, index, True, doc_name, get_flashcard_results(doc_name, cards), lang)
 
 
 def flashcard_end_game_view(doc_name, total, known_count, review_count):
@@ -1070,12 +1356,12 @@ def flashcard_end_game_view(doc_name, total, known_count, review_count):
         <div><b>{known_count}</b><span>Maîtrisées</span></div>
         <div><b>{review_count}</b><span>À revoir</span></div>
       </div>
-      <p style="margin-top:18px;">Cliquez sur <b>« 🔄 Régénérer (7 minimum) »</b> pour obtenir une nouvelle série.</p>
+      <p style="margin-top:18px;">Cliquez sur « 🔄 Régénérer (7 minimum) » pour obtenir une nouvelle série.</p>
     </div>
     """
 
 
-def flashcard_mark_handler(cards, index, mark_type, doc_name):
+def flashcard_mark_handler(cards, index, mark_type, doc_name, lang=None):
     cards = normalize_flashcards(cards)
     if not cards:
         return 0, False, flashcard_view([], 0, False), gr.update(visible=False), gr.update()
@@ -1091,7 +1377,7 @@ def flashcard_mark_handler(cards, index, mark_type, doc_name):
         return (next_index, False,
                 flashcard_end_game_view(doc_name, st["total"], st["known"], st["review"]),
                 gr.update(visible=False), gr.update(value=REGENERATE_LABEL))
-    return (next_index, False, flashcard_view(cards, next_index, False, doc_name, results),
+    return (next_index, False, flashcard_view(cards, next_index, False, doc_name, results, lang),
             gr.update(visible=True), gr.update())
 
 
@@ -1178,6 +1464,8 @@ def quiz_view(questions, index=0, validated=False, answers=None):
 
 def quiz_generate_handler(doc_name, lang=None):
     qs, status = generate_quiz_v12(doc_name, lang=lang)
+    if qs:
+        _log("quiz", detail=f"{doc_name} · {len(qs)}")
     return (qs, 0, False, quiz_view(qs, 0, False, []), status,
             _quiz_radio(qs, 0), [None] * len(qs), gr.update(value=NEXT_LABEL))
 
@@ -1981,6 +2269,8 @@ html:root:root:root:root body.akori-dark iframe { filter:invert(.92) hue-rotate(
 #nav-reviewq::before { content:"!"; }
 #nav-history::before { content:"◷"; }
 #nav-settings::before { content:"⚙"; }
+#nav-admin::before { content:"🛡"; }
+#nav-logout::before { content:"⏻"; }
 
 /* NB : Gradio recopie chaque règle avec un préfixe ".gradio-container … .contain" qui lui donne plus
    de poids. Les états (replié / survol) passent donc par des variables CSS posées sur <body>. */
@@ -1992,8 +2282,8 @@ body.sidebar-collapsed:has(#sidebar:hover) { --sb-w:var(--sb-open); --main-ml:ca
 
 /* mise en page stable : toutes les pages ont la même largeur, barre de défilement toujours présente */
 html { overflow-y:scroll!important; }
-.gradio-container:has(#main-column), .main:has(#main-column), .wrap:has(#main-column), .contain:has(#main-column),
-.column:has(> .row > #main-column), .row:has(> #main-column) { width:100%!important; }
+.gradio-container, .gradio-container .main, .gradio-container .main > .wrap, .gradio-container .contain,
+.gradio-container .contain > .column, .column:has(> .row > #main-column), .row:has(> #main-column) { width:100%!important; }
 .row:has(> #main-column) { flex-wrap:nowrap!important; }
 
 #sidebar {
@@ -2144,6 +2434,66 @@ html:root:root:root:root body.akori-dark #lang-choice label:has(input:checked) {
   #documents-row > :first-child { flex:1 1 100%!important; }
   #documents-row #add-document-tile { flex:1 1 100%!important;width:100%!important;max-width:none!important;height:110px!important;min-height:110px!important;order:-1; }
 }
+
+/* ===== Éléments techniques masqués ===== */
+.akori-hidden { display:none!important; }
+body.akori-reconnecting #login-view { visibility:hidden; }
+
+/* ===== Badge utilisateur (menu) ===== */
+#user-badge { flex:none!important; }
+.user-badge { display:flex;align-items:center;gap:10px;padding:10px 2px 4px;white-space:nowrap;overflow:hidden; }
+.ub-avatar { width:34px;height:34px;border-radius:50%;background:linear-gradient(135deg,#4f6df5,#8e6cf4);color:#fff!important;font-weight:800;font-size:14px;display:flex;align-items:center;justify-content:center;flex:none;margin-left:7px; }
+.ub-text b { display:block;font-size:13px;color:var(--ak-text);line-height:1.2; }
+.ub-text span { display:block;font-size:11px;color:#8993a7;line-height:1.3; }
+#sidebar #nav-logout { margin-top:0!important; }
+
+/* ===== Page de connexion ===== */
+#login-view { min-height:calc(100vh - 40px);display:flex!important;flex-direction:column!important;align-items:center!important;justify-content:center!important;gap:18px!important;padding:28px 14px; }
+.login-hero { text-align:center; }
+.login-hero .brand-mark { width:68px;height:68px;border-radius:20px;background:linear-gradient(135deg,#4768f5,#8e6cf4);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:900;font-size:34px;margin:0 auto 12px;box-shadow:0 12px 28px rgba(79,109,245,.28); }
+.login-hero h1 { margin:0;font-size:34px;letter-spacing:.04em;color:var(--ak-text)!important; }
+.login-hero p { margin:6px 0 0;font-size:12px;letter-spacing:.06em;color:#7b8497!important; }
+#login-card { width:min(440px,100%)!important;max-width:440px;flex:none!important;background:#fff!important;border:1px solid var(--ak-line)!important;border-radius:22px!important;padding:26px!important;box-shadow:0 18px 50px rgba(42,55,90,.10);gap:12px!important; }
+.login-welcome h2 { margin:0 0 4px;font-size:21px;color:var(--ak-text)!important; }
+.login-welcome p { margin:0 0 6px;font-size:13px;color:#778298!important;line-height:1.5; }
+#li-btn, #su-btn { width:100%!important;min-height:46px!important;margin-top:4px; }
+#login-status { min-height:22px;font-size:13px; }
+.login-foot { text-align:center;font-size:11.5px;color:#8993a7;line-height:1.5; }
+#auth-tabs .tab-nav, #auth-tabs [role="tablist"] { display:flex!important;visibility:visible!important;height:auto!important;margin:0 0 10px!important; }
+
+/* ===== Console d'administration ===== */
+#admin-view { width:min(1240px,100%)!important;margin:0 auto!important;padding:18px 6px 40px;gap:16px!important; }
+#admin-top { align-items:center!important;gap:12px!important;flex-wrap:wrap!important; }
+.admin-title { display:flex;align-items:center;gap:14px; }
+.admin-title h1 { margin:0;font-size:24px;color:var(--ak-text)!important; }
+.admin-title p { margin:3px 0 0;font-size:13px;color:#778298!important; }
+.admin-badge { width:50px;height:50px;border-radius:16px;background:linear-gradient(135deg,#4768f5,#8e6cf4);display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 8px 20px rgba(79,109,245,.25); }
+.admin-kpis { display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px; }
+.admin-kpi { background:#fff;border:1px solid var(--ak-line);border-radius:16px;padding:16px;box-shadow:0 4px 14px rgba(42,55,90,.03); }
+.admin-kpi b { display:block;font-size:24px;color:var(--ak-text); }
+.admin-kpi span { font-size:12px;color:#778298; }
+.admin-kpi.warn b { color:#d95b67; }
+.admin-service { display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px;margin-bottom:12px; }
+.admin-service > div { background:#fff;border:1px solid var(--ak-line);border-radius:14px;padding:12px 14px; }
+.admin-service span { display:block;font-size:11.5px;color:#778298;margin-bottom:3px; }
+.admin-service b { font-size:13.5px;color:var(--ak-text);word-break:break-all; }
+#admin-top .gr-button, #admin-top button { min-height:44px; }
+@media (max-width:700px) { #login-card { padding:20px!important; } .login-hero h1 { font-size:28px; } }
+
+/* thème sombre : connexion, admin, badge */
+html:root:root:root:root body.akori-dark #login-card,
+html:root:root:root:root body.akori-dark .admin-kpi,
+html:root:root:root:root body.akori-dark .admin-service > div { background:#161e30!important;border-color:#27324a!important; }
+html:root:root:root:root body.akori-dark .login-hero h1, html:root:root:root:root body.akori-dark .login-welcome h2,
+html:root:root:root:root body.akori-dark .admin-title h1, html:root:root:root:root body.akori-dark .admin-kpi b,
+html:root:root:root:root body.akori-dark .admin-service b, html:root:root:root:root body.akori-dark .ub-text b { color:#e6ebf7!important; }
+html:root:root:root:root body.akori-dark .login-welcome p, html:root:root:root:root body.akori-dark .login-hero p,
+html:root:root:root:root body.akori-dark .admin-title p, html:root:root:root:root body.akori-dark .admin-kpi span,
+html:root:root:root:root body.akori-dark .admin-service span, html:root:root:root:root body.akori-dark .login-foot { color:#9aa6bf!important; }
+
+/* le conteneur racine de Gradio ne doit pas former un panneau plein */
+.gradio-container > .main > .wrap { background:transparent!important;border-color:transparent!important;box-shadow:none!important; }
+html:root:root:root:root body.akori-dark .gradio-container > .main > .wrap { background:transparent!important;border-color:transparent!important; }
 """
 
 
@@ -2161,32 +2511,40 @@ LANG_APPLY_JS = r"""
 """
 
 I18N_SRC = r"""
-  const I18N = [["NAVIGATION", "NAVIGATION", "FIDIRANA"], ["Accueil", "Home", "Fandraisana"], ["Mes dossiers", "My folders", "Ireo rakitra"], ["Réviser", "Revise", "Hamerina"], ["Flashcards", "Flashcards", "Flashcards"], ["Quiz / QCM", "Quiz / MCQ", "Fanontaniana / QCM"], ["Résumé", "Summary", "Fintina"], ["Assistant IA", "AI Assistant", "Mpanampy IA"], ["Progression", "Progress", "Fandrosoana"], ["À revoir", "To review", "Hojerena indray"], ["Historique", "History", "Tantara"], ["Paramètres", "Settings", "Fanamboarana"], ["AKORI · Espace de révision", "AKORI · Revision space", "AKORI · Toerana famerenana lesona"], ["Cours actif", "Active course", "Lesona mavitrika"], ["Bonjour 👋", "Hello 👋", "Salama 👋"], ["Prêt à booster votre révision ?", "Ready to boost your revision?", "Vonona hampandroso ny famerenanao lesona ve?"], ["AKORI transforme vos cours PDF en un espace de révision intelligent : résumé, flashcards roulette, quiz et assistant RAG.", "AKORI turns your PDF courses into a smart revision space: summary, roulette flashcards, quiz and RAG assistant.", "Ovain'i AKORI ho toerana famerenana lesona mahira ny PDF-nao: fintina, flashcards, quiz ary mpanampy RAG."], ["💡 Guide de révision AKORI & mode roulette flashcards", "💡 AKORI revision guide & flashcards roulette mode", "💡 Torolalana AKORI & flashcards roulette"], ["1. Chargez vos dossiers", "1. Load your folders", "1. Ampidiro ny rakitrao"], ["Glissez vos PDF dans Mes dossiers pour activer l'indexation FAISS.", "Drop your PDFs in My folders to enable FAISS indexing.", "Alefaso ao amin'ny Ireo rakitra ny PDF-nao mba hampandehanana ny FAISS."], ["2. Lancement roulette", "2. Start the roulette", "2. Fanombohana ny roulette"], ["Générez au moins 7 flashcards. Les questions défilent automatiquement en boucle.", "Generate at least 7 flashcards. Questions scroll automatically in a loop.", "Mamoròna flashcards 7 farafahakeliny. Mivezivezy ho azy ny fanontaniana."], ["3. Clic & réponse effacée", "3. Click & answer hidden", "3. Tsindrio & miafina ny valiny"], ["Cliquez sur la carte pour stopper/relancer. La réponse s'efface à chaque relance.", "Click the card to stop/restart. The answer is hidden at each restart.", "Tsindrio ny karatra hampijanona/handefa indray. Miafina ny valiny isaky ny mandeha indray."], ["Cours importés", "Imported courses", "Lesona nampidirina"], ["Fragments indexés", "Indexed fragments", "Ampahany voasivana"], ["Échanges du cours", "Course exchanges", "Resaka momba ny lesona"], ["Recherche active", "Search active", "Fikarohana mavitrika"], ["Réviser un cours en un clic", "Revise a course in one click", "Mamerina lesona amin'ny tsindry iray"], ["Générez les outils principaux à partir du cours actif.", "Generate the main tools from the active course.", "Mamoròna ny fitaovana lehibe avy amin'ny lesona mavitrika."], ["Résumé · Flashcards · Quiz / QCM · Assistant IA", "Summary · Flashcards · Quiz / MCQ · AI Assistant", "Fintina · Flashcards · Quiz / QCM · Mpanampy IA"], ["Mes cours", "My courses", "Ny lesoko"], ["Vos supports de révision indexés localement.", "Your revision materials indexed locally.", "Ny fitaovam-pamerenana lesonao voasivana eto an-toerana."], ["Aucun cours sélectionné", "No course selected", "Tsy misy lesona voafidy"], ["Commencer la révision →", "Start revising →", "Atombohy ny famerenana →"], ["Tous vos supports PDF sont centralisés ici. Dès qu'un document est sélectionné, AKORI extrait son contenu et construit automatiquement son index.", "All your PDF materials are gathered here. As soon as a document is selected, AKORI extracts its content and builds its index automatically.", "Eto no ao ny PDF rehetra. Raha vao voafidy ny rakitra iray dia manala ny votoatiny sy mamorona ny index ho azy i AKORI."], ["＋\nAjouter un document", "＋\nAdd a document", "＋\nHanampy rakitra"], ["Sélectionnez un PDF : extraction et indexation automatiques.", "Select a PDF: automatic extraction and indexing.", "Fidio ny PDF: ho azy ny fakana sy fanasivanana."], ["Indexé", "Indexed", "Voasivana"], ["Sélectionnez un cours pour afficher son espace de révision.", "Select a course to display its revision space.", "Fidio ny lesona hanehoana ny toerana famerenana azy."], ["Réviser ce cours", "Revise this course", "Hamerina ity lesona ity"], ["Une vue centrale pour accéder rapidement au résumé, aux flashcards, au quiz et à l'assistant.", "A central view to quickly reach the summary, flashcards, quiz and assistant.", "Fijery mampiray hidirana haingana ny fintina, flashcards, quiz ary mpanampy."], ["Flashcards — Mode Roulette", "Flashcards — Roulette mode", "Flashcards — Fomba roulette"], ["✦ Générer les flashcards", "✦ Generate flashcards", "✦ Mamorona flashcards"], ["🔄 Régénérer (7 minimum)", "🔄 Regenerate (7 minimum)", "🔄 Averina (7 farafahakeliny)"], ["Afficher la réponse", "Show the answer", "Asehoy ny valiny"], ["✓ Je savais", "✓ I knew it", "✓ Fantatro"], ["↻ À revoir", "↻ To review", "↻ Hojerena indray"], ["Aucune flashcard générée.", "No flashcards generated.", "Tsy mbola misy flashcard noforonina."], ["Choisissez un cours puis cliquez sur « Générer les flashcards ».", "Choose a course then click “Generate flashcards”.", "Fidio ny lesona dia tsindrio ny « Mamorona flashcards »."], ["Quiz d'évaluation", "Evaluation quiz", "Quiz fanombanana"], ["Cliquez sur une réponse, validez, puis passez à la question suivante.", "Click an answer, validate, then go to the next question.", "Tsindrio ny valiny, apetraho, dia mandehana amin'ny fanontaniana manaraka."], ["✦ Générer le quiz", "✦ Generate the quiz", "✦ Mamorona ny quiz"], ["🔁 Rejouer", "🔁 Replay", "🔁 Averina"], ["Valider la réponse", "Validate the answer", "Apetraho ny valiny"], ["Question suivante →", "Next question →", "Fanontaniana manaraka →"], ["Voir le résultat 🎯", "See the result 🎯", "Jereo ny valiny 🎯"], ["Choisissez votre réponse", "Choose your answer", "Fidio ny valinao"], ["Aucun quiz généré.", "No quiz generated.", "Tsy mbola misy quiz noforonina."], ["Choisissez un cours puis cliquez sur « Générer le quiz ».", "Choose a course then click “Generate the quiz”.", "Fidio ny lesona dia tsindrio ny « Mamorona ny quiz »."], ["Résumé du cours", "Course summary", "Fintinin'ny lesona"], ["Générer le résumé", "Generate the summary", "Mamorona ny fintina"], ["Sélectionnez un cours puis lancez la génération.", "Select a course then start the generation.", "Fidio ny lesona dia alefaso ny famoronana."], ["Assistant AKORI", "AKORI Assistant", "Mpanampy AKORI"], ["Posez une question sur le cours actif. Le moteur récupère d'abord les passages pertinents avec FAISS, puis Gemini génère la réponse à partir du contexte récupéré.", "Ask a question about the active course. The engine first retrieves the relevant passages with FAISS, then Gemini generates the answer from the retrieved context.", "Manontania momba ny lesona mavitrika. Mandray ny fizarana mifandraika amin'izany amin'ny FAISS aloha ny rafitra, dia mamorona ny valiny i Gemini."], ["Envoyer", "Send", "Alefa"], ["Posez une question sur le cours…", "Ask a question about the course…", "Manontania momba ny lesona…"], ["Ma progression", "My progress", "Ny fandrosoako"], ["Commencez par la vue globale, puis consultez le détail du cours sélectionné.", "Start with the global view, then check the details of the selected course.", "Atombohy amin'ny fijery iray manontolo, dia jereo ny antsipirian'ny lesona voafidy."], ["Détail du cours sélectionné", "Selected course details", "Antsipirian'ny lesona voafidy"], ["Cette section regroupera les flashcards marquées « À revoir » et les erreurs de quiz.", "This section will gather the flashcards marked “To review” and the quiz mistakes.", "Eto no hanangonana ny flashcards voamarika « Hojerena indray » sy ny hadisoana tamin'ny quiz."], ["Historique du cours actif", "Active course history", "Tantaran'ny lesona mavitrika"], ["Aucun historique pour le moment.", "No history yet.", "Mbola tsy misy tantara."], ["Paramètres", "Settings", "Fanamboarana"], ["Personnalisez AKORI. Vos choix sont mémorisés dans ce navigateur.", "Customize AKORI. Your choices are saved in this browser.", "Ataovy araka ny tianao i AKORI. Voatahiry ao amin'ity navigateur ity ny safidinao."], ["Mode sombre", "Dark mode", "Maody maizina"], ["Basculez entre le thème clair et le thème sombre d'un seul clic.", "Switch between the light and dark theme with one click.", "Ovao amin'ny tsindry iray ny lohahevitra mazava sy maizina."], ["Langue", "Language", "Fiteny"], ["Langue de l'interface et des réponses générées par l'IA.", "Language of the interface and of the answers generated by the AI.", "Fiteny ampiasaina amin'ny interface sy ny valin'ny IA."], ["⏳ Génération des flashcards…", "⏳ Generating flashcards…", "⏳ Famoronana flashcards…"], ["⏳ Génération du quiz…", "⏳ Generating the quiz…", "⏳ Famoronana ny quiz…"], ["⏳ Génération du résumé…", "⏳ Generating the summary…", "⏳ Famoronana ny fintina…"], ["⚠️ Sélectionnez d'abord un cours.", "⚠️ Select a course first.", "⚠️ Fidio aloha ny lesona."], ["⚠️ Sélectionnez une réponse avant de valider.", "⚠️ Select an answer before validating.", "⚠️ Fidio ny valiny alohan'ny hanamarina."], ["✅ Bonne réponse.", "✅ Correct answer.", "✅ Valiny marina."], ["QUIZ TERMINÉ", "QUIZ COMPLETED", "VITA NY QUIZ"], ["SESSION TERMINÉE", "SESSION COMPLETED", "VITA NY FIANARANA"], ["Maîtrise", "Mastery", "Fahaizana"], ["Maîtrisées", "Mastered", "Fehezina"], ["Aucun cours pour le moment.", "No course yet.", "Mbola tsy misy lesona."]];
-  const LANG_INDEX = { fr: 0, en: 1, mg: 2 };
-  const codeOf = (label) => /English/.test(label) ? 'en' : (/Malagasy/.test(label) ? 'mg' : 'fr');
-  const labelOf = (code) => ({ fr: 'Français', en: 'English', mg: 'Malagasy' }[code] || 'Français');
-  const map = { en: new Map(), mg: new Map() };
-  I18N.forEach(([fr, en, mg]) => { map.en.set(fr.trim(), en); map.mg.set(fr.trim(), mg); });
+  const I18N = [["NAVIGATION", "NAVIGATION"], ["Accueil", "Home"], ["Mes dossiers", "My folders"], ["Réviser", "Revise"], ["Flashcards", "Flashcards"], ["Quiz / QCM", "Quiz / MCQ"], ["Résumé", "Summary"], ["Assistant IA", "AI Assistant"], ["Progression", "Progress"], ["À revoir", "To review"], ["Historique", "History"], ["Paramètres", "Settings"], ["Administration", "Administration"], ["Déconnexion", "Log out"], ["Administrateur", "Administrator"], ["Utilisateur", "User"], ["AKORI · Espace de révision", "AKORI · Revision space"], ["Cours actif", "Active course"], ["Bonjour 👋", "Hello 👋"], ["Prêt à booster votre révision ?", "Ready to boost your revision?"], ["AKORI transforme vos cours PDF en un espace de révision intelligent : résumé, flashcards roulette, quiz et assistant RAG.", "AKORI turns your PDF courses into a smart revision space: summary, roulette flashcards, quiz and RAG assistant."], ["💡 Guide de révision AKORI & mode roulette flashcards", "💡 AKORI revision guide & flashcards roulette mode"], ["1. Chargez vos dossiers", "1. Load your folders"], ["Glissez vos PDF dans Mes dossiers pour activer l'indexation FAISS.", "Drop your PDFs in My folders to enable FAISS indexing."], ["2. Lancement roulette", "2. Start the roulette"], ["Générez au moins 7 flashcards. Les questions défilent automatiquement en boucle.", "Generate at least 7 flashcards. Questions scroll automatically in a loop."], ["3. Clic & réponse effacée", "3. Click & answer hidden"], ["Cliquez sur la carte pour stopper/relancer. La réponse s'efface à chaque relance.", "Click the card to stop/restart. The answer is hidden at each restart."], ["Cours importés", "Imported courses"], ["Fragments indexés", "Indexed fragments"], ["Échanges du cours", "Course exchanges"], ["Recherche active", "Search active"], ["Réviser un cours en un clic", "Revise a course in one click"], ["Générez les outils principaux à partir du cours actif.", "Generate the main tools from the active course."], ["Résumé · Flashcards · Quiz / QCM · Assistant IA", "Summary · Flashcards · Quiz / MCQ · AI Assistant"], ["Mes cours", "My courses"], ["Vos supports de révision indexés localement.", "Your revision materials indexed locally."], ["Aucun cours sélectionné", "No course selected"], ["Commencer la révision →", "Start revising →"], ["Tous vos supports PDF sont centralisés ici. Dès qu'un document est sélectionné, AKORI extrait son contenu et construit automatiquement son index.", "All your PDF materials are gathered here. As soon as a document is selected, AKORI extracts its content and builds its index automatically."], ["＋\nAjouter un document", "＋\nAdd a document"], ["Sélectionnez un PDF : extraction et indexation automatiques.", "Select a PDF: automatic extraction and indexing."], ["Indexé", "Indexed"], ["Sélectionnez un cours pour afficher son espace de révision.", "Select a course to display its revision space."], ["Date inconnue", "Unknown date"], ["Général", "General"], ["📁 Aucun document pour le moment.", "📁 No document yet."], ["Ajoutez votre premier PDF pour commencer.", "Add your first PDF to get started."], ["📚 Aucun cours pour le moment.", "📚 No course yet."], ["Importez votre premier PDF dans 'Mes dossiers' pour commencer.", "Import your first PDF in 'My folders' to get started."], ["Aucun document chargé.", "No document loaded."], ["Réviser ce cours", "Revise this course"], ["Une vue centrale pour accéder rapidement au résumé, aux flashcards, au quiz et à l'assistant.", "A central view to quickly reach the summary, flashcards, quiz and assistant."], ["Flashcards — Mode Roulette", "Flashcards — Roulette mode"], ["✦ Générer les flashcards", "✦ Generate flashcards"], ["🔄 Régénérer (7 minimum)", "🔄 Regenerate (7 minimum)"], ["Afficher la réponse", "Show the answer"], ["✓ Je savais", "✓ I knew it"], ["↻ À revoir", "↻ To review"], ["Aucune flashcard générée.", "No flashcards generated."], ["Choisissez un cours puis cliquez sur « Générer les flashcards ».", "Choose a course then click “Generate flashcards”."], ["SESSION TERMINÉE", "SESSION COMPLETED"], ["Maîtrise", "Mastery"], ["Maîtrisées", "Mastered"], ["Cliquez sur « 🔄 Régénérer (7 minimum) » pour obtenir une nouvelle série.", "Click “🔄 Regenerate (7 minimum)” to get a new set."], ["Quiz d'évaluation", "Evaluation quiz"], ["Cliquez sur une réponse, validez, puis passez à la question suivante.", "Click an answer, validate, then go to the next question."], ["✦ Générer le quiz", "✦ Generate the quiz"], ["🔁 Rejouer", "🔁 Replay"], ["Valider la réponse", "Validate the answer"], ["Question suivante →", "Next question →"], ["Voir le résultat 🎯", "See the result 🎯"], ["Choisissez votre réponse", "Choose your answer"], ["Aucun quiz généré.", "No quiz generated."], ["Choisissez un cours puis cliquez sur « Générer le quiz ».", "Choose a course then click “Generate the quiz”."], ["QUIZ TERMINÉ", "QUIZ COMPLETED"], ["Votre résultat a été enregistré dans la progression de ce cours.", "Your result has been saved in this course's progress."], ["🏆 Sans faute, bravo !", "🏆 Perfect score, well done!"], ["✅ Bonne réponse !", "✅ Correct answer!"], ["❌ Réponse incorrecte", "❌ Incorrect answer"], ["Explication :", "Explanation:"], ["Résumé du cours", "Course summary"], ["Générer le résumé", "Generate the summary"], ["Sélectionnez un cours puis lancez la génération.", "Select a course then start the generation."], ["Assistant AKORI", "AKORI Assistant"], ["Posez une question sur le cours actif. Le moteur récupère d'abord les passages pertinents avec FAISS, puis Gemini génère la réponse à partir du contexte récupéré.", "Ask a question about the active course. The engine first retrieves the relevant passages with FAISS, then Gemini generates the answer from the retrieved context."], ["Envoyer", "Send"], ["Posez une question sur le cours…", "Ask a question about the course…"], ["Ma progression", "My progress"], ["Commencez par la vue globale, puis consultez le détail du cours sélectionné.", "Start with the global view, then check the details of the selected course."], ["Détail du cours sélectionné", "Selected course details"], ["Votre progression commencera ici.", "Your progress will start here."], ["Importez un cours pour créer votre premier suivi. Tant qu'aucun cours n'est chargé, la progression reste à 0 %.", "Import a course to create your first tracking. As long as no course is loaded, progress stays at 0%."], ["Aucune progression à afficher.", "No progress to display."], ["Importez un cours puis utilisez les flashcards ou terminez un quiz pour commencer à construire votre progression.", "Import a course then use the flashcards or finish a quiz to start building your progress."], ["VUE D'ENSEMBLE", "OVERVIEW"], ["Progression globale", "Global progress"], ["Synthèse de tous vos cours réellement importés et de vos interactions de révision.", "Summary of all your imported courses and your revision interactions."], ["Cours suivis", "Tracked courses"], ["Cours commencés", "Started courses"], ["Flashcards maîtrisées", "Mastered flashcards"], ["Moyenne des quiz", "Quiz average"], ["Progression par cours", "Progress by course"], ["Le détail pédagogique reste lié au cours sélectionné : points forts, points faibles, flashcards et résultats des quiz.", "The detailed breakdown stays linked to the selected course: strengths, weaknesses, flashcards and quiz results."], ["Calculée uniquement à partir des interactions enregistrées sur ce cours.", "Computed only from the interactions recorded on this course."], ["Quiz terminés", "Completed quizzes"], ["✦ Points forts", "✦ Strengths"], ["↗ Points faibles", "↗ Weaknesses"], ["Pas encore assez de réponses de quiz pour identifier un point fort.", "Not enough quiz answers yet to identify a strength."], ["Pas encore assez de réponses de quiz pour identifier un point faible.", "Not enough quiz answers yet to identify a weakness."], ["Aucun point fort clairement établi pour le moment.", "No clear strength established yet."], ["Aucun point faible clairement établi pour le moment.", "No clear weakness established yet."], ["Cette section regroupera les flashcards marquées « À revoir » et les erreurs de quiz.", "This section will gather the flashcards marked “To review” and the quiz mistakes."], ["📌 Votre file « À revoir » apparaîtra ici après les interactions.", "📌 Your “To review” queue will appear here after some interactions."], ["Historique du cours actif", "Active course history"], ["Aucun historique pour le moment.", "No history yet."], ["Aucune conversation enregistrée.", "No conversation recorded."], ["Vous", "You"], ["Personnalisez AKORI. Vos choix sont mémorisés dans ce navigateur.", "Customize AKORI. Your choices are saved in this browser."], ["Mode sombre", "Dark mode"], ["Basculez entre le thème clair et le thème sombre d'un seul clic.", "Switch between the light and dark theme with one click."], ["Langue", "Language"], ["Langue de l'interface et des réponses générées par l'IA.", "Language of the interface and of the generated summaries, flashcards and quizzes. In the chat, AKORI answers in the language you write in."], ["Connexion", "Sign in"], ["Créer un compte", "Create an account"], ["Nom d'utilisateur", "Username"], ["Mot de passe", "Password"], ["Confirmer le mot de passe", "Confirm the password"], ["Rester connecté", "Stay signed in"], ["Se connecter", "Sign in"], ["Créer mon compte", "Create my account"], ["Bienvenue sur AKORI", "Welcome to AKORI"], ["Connectez-vous pour retrouver vos cours, flashcards, quiz et historiques archivés.", "Sign in to find your archived courses, flashcards, quizzes and history."], ["Vos données sont enregistrées dans votre compte et restent disponibles à chaque connexion.", "Your data is saved in your account and available every time you sign in."], ["⚠️ Nom d'utilisateur invalide (3 à 32 caractères : lettres, chiffres, . _ -).", "⚠️ Invalid username (3 to 32 characters: letters, digits, . _ -)."], ["⚠️ Mot de passe trop court (6 caractères minimum).", "⚠️ Password too short (6 characters minimum)."], ["⚠️ Ce nom d'utilisateur existe déjà.", "⚠️ This username already exists."], ["✅ Compte créé.", "✅ Account created."], ["⚠️ Identifiants incorrects.", "⚠️ Incorrect username or password."], ["⛔ Ce compte est désactivé. Contactez l'administrateur.", "⛔ This account is disabled. Contact the administrator."], ["⏳ Trop de tentatives. Réessayez dans une minute.", "⏳ Too many attempts. Try again in a minute."], ["⚠️ Les mots de passe ne correspondent pas.", "⚠️ The passwords do not match."], ["✅ Vous êtes déconnecté.", "✅ You are signed out."], ["Connexion requise.", "Sign-in required."], ["⏳ Analyse du PDF… extraction, découpage et indexation en cours.", "⏳ Analyzing the PDF… extraction, splitting and indexing in progress."], ["⏳ Extraction du texte…", "⏳ Extracting the text…"], ["⏳ Enregistrement…", "⏳ Saving…"], ["⚠️ Aucun fichier sélectionné.", "⚠️ No file selected."], ["⚠️ Aucun texte exploitable dans ce PDF (document scanné ?).", "⚠️ No usable text in this PDF (scanned document?)."], ["⚠️ Veuillez d'abord sélectionner un cours.", "⚠️ Please select a course first."], ["⏳ Génération…", "⏳ Generating…"], ["⚠️ Le titre du document est indisponible.", "⚠️ The document title is unavailable."], ["⚠️ Aucune information pertinente n'a pu être extraite du document.", "⚠️ No relevant information could be extracted from the document."], ["Gemini est très sollicité en ce moment. Réessayez dans une dizaine de secondes.", "Gemini is very busy right now. Try again in about ten seconds."], ["Quota ou limite temporaire Gemini atteinte. Attendez un peu avant de relancer la génération.", "Gemini quota or temporary limit reached. Wait a little before generating again."], ["⚠️ Gemini est temporairement indisponible. Réessayez dans quelques secondes.", "⚠️ Gemini is temporarily unavailable. Try again in a few seconds."], ["⚠️ La limite temporaire de Gemini a été atteinte. Attendez un peu puis réessayez.", "⚠️ Gemini's temporary limit was reached. Wait a little then try again."], ["⚠️ Impossible de générer les flashcards à partir du contexte.", "⚠️ Unable to generate flashcards from the context."], ["⚠️ Impossible de générer le quiz.", "⚠️ Unable to generate the quiz."], ["⚠️ Sélectionnez d'abord un cours.", "⚠️ Select a course first."], ["⚠️ Aucun document sélectionné.", "⚠️ No document selected."], ["❌ Document vide.", "❌ Empty document."], ["❌ Le modèle n'a renvoyé aucune flashcard valide.", "❌ The model returned no valid flashcard."], ["⏳ Génération des flashcards…", "⏳ Generating flashcards…"], ["⏳ Génération du quiz…", "⏳ Generating the quiz…"], ["⏳ Génération du résumé…", "⏳ Generating the summary…"], ["🔁 Quiz relancé.", "🔁 Quiz restarted."], ["⚠️ Générez d'abord un quiz.", "⚠️ Generate a quiz first."], ["ℹ️ Réponse déjà validée : passez à la suite.", "ℹ️ Answer already validated: move on."], ["⚠️ Sélectionnez une réponse avant de valider.", "⚠️ Select an answer before validating."], ["✅ Bonne réponse.", "✅ Correct answer."], ["❌ Réponse incorrecte. Consultez l'explication.", "❌ Incorrect answer. Check the explanation."], ["⚠️ Validez d'abord cette réponse.", "⚠️ Validate this answer first."], ["Console d'administration", "Administration console"], ["Suivi, maintenance et gestion des comptes AKORI", "Monitoring, maintenance and account management for AKORI"], ["← Retour à l'application", "← Back to the app"], ["↻ Actualiser", "↻ Refresh"], ["Utilisateurs", "Users"], ["Activité", "Activity"], ["Maintenance", "Maintenance"], ["Nouveau mot de passe", "New password"], ["Activer / Désactiver", "Enable / Disable"], ["Réinitialiser le mot de passe", "Reset the password"], ["Promouvoir / Rétrograder", "Promote / Demote"], ["Supprimer le compte", "Delete the account"], ["Je confirme la suppression définitive du compte et de ses données", "I confirm the permanent deletion of the account and its data"], ["Sauvegarde complète (ZIP)", "Full backup (ZIP)"], ["Recharger les index", "Reload the indexes"], ["Purger les connexions expirées", "Purge expired sign-ins"], ["Alléger le journal", "Trim the log"], ["Sauvegarde", "Backup"], ["Comptes", "Accounts"], ["Actifs (24 h)", "Active (24 h)"], ["Stockage utilisé", "Storage used"], ["Requêtes IA", "AI requests"], ["Jetons estimés", "Estimated tokens"], ["Erreurs (24 h)", "Errors (24 h)"], ["Sessions en ligne", "Online sessions"], ["Modèle principal", "Main model"], ["Modèles de secours", "Fallback models"], ["Clé API Gemini", "Gemini API key"], ["Disponibilité", "Uptime"], ["Dossier de données", "Data folder"], ["Taille PDF maximale", "Maximum PDF size"], ["✅ configurée", "✅ configured"], ["⛔ Accès réservé à l'administrateur.", "⛔ Reserved for the administrator."], ["⚠️ Sélectionnez un utilisateur.", "⚠️ Select a user."], ["⚠️ Vous ne pouvez pas désactiver votre propre compte.", "⚠️ You cannot disable your own account."], ["⚠️ Vous ne pouvez pas supprimer votre propre compte.", "⚠️ You cannot delete your own account."], ["⚠️ Il doit rester au moins un administrateur.", "⚠️ At least one administrator must remain."], ["⚠️ Cochez la confirmation pour supprimer définitivement ce compte et ses données.", "⚠️ Tick the confirmation to permanently delete this account and its data."], ["Rôle", "Role"], ["Statut", "Status"], ["Créé le", "Created on"], ["Dernière connexion", "Last sign-in"], ["Connexions", "Sign-ins"], ["Cours", "Courses"], ["Échanges", "Exchanges"], ["Quiz", "Quizzes"], ["Stockage", "Storage"], ["Actif", "Active"], ["Désactivé", "Disabled"], ["Date", "Date"], ["Événement", "Event"], ["Détail", "Detail"]];
+  const PATTERNS = [["^✅ '(.+)' indexé avec succès \\((\\d+) fragments\\)\\.$", "✅ '$1' indexed successfully ($2 fragments)."], ["^✅ '(.+)' est déjà indexé : réutilisé instantanément\\.$", "✅ '$1' is already indexed: reused instantly."], ["^❌ Erreur lors de l'indexation : (.*)$", "❌ Indexing error: $1"], ["^⏳ Indexation (\\d+)\\/(\\d+)…$", "⏳ Indexing $1/$2…"], ["^⚠️ Fichier trop volumineux \\(maximum (\\d+) Mo\\)\\.$", "⚠️ File too large (maximum $1 MB)."], ["^✅ (\\d+) flashcards prêtes !$", "✅ $1 flashcards ready!"], ["^⚠️ Seulement (\\d+) flashcard\\(s\\) obtenue\\(s\\) : il en faut au moins (\\d+)\\. Relancez la génération\\.$", "⚠️ Only $1 flashcard(s) obtained: at least $2 are needed. Generate again."], ["^❌ Erreur : (.*)$", "❌ Error: $1"], ["^⚠️ Génération impossible : (.*)$", "⚠️ Generation failed: $1"], ["^✅ Quiz de (\\d+) questions généré\\.$", "✅ Quiz of $1 questions generated."], ["^🎯 Quiz terminé : (\\d+)\\/(\\d+)\\.$", "🎯 Quiz completed: $1/$2."], ["^Score : (\\d+)$", "Score: $1"], ["^(\\d+)% de bonnes réponses$", "$1% correct answers"], ["^Bonne réponse : (.*)$", "Correct answer: $1"], ["^Le titre du document est : (.*)$", "The title of the document is: $1"], ["^QUIZ \\/ QCM · (.*)$", "QUIZ / MCQ · $1"], ["^(\\d+) fragments indexés · Progression (\\d+)% · RAG local$", "$1 indexed fragments · Progress $2% · Local RAG"], ["^Progression réelle · (.*)$", "Real progress · $1"], ["^Ajouté le (.*)$", "Added on $1"], ["^Indexé · (\\d+) fragments$", "Indexed · $1 fragments"], ["^✅ Compte « (.+) » (activé|désactivé)\\.$", "✅ Account “$1” updated."], ["^✅ Mot de passe de « (.+) » réinitialisé.*$", "✅ Password of “$1” reset (their remembered sign-ins are revoked)."], ["^✅ « (.+) » est maintenant (administrateur|utilisateur)\\.$", "✅ “$1” role updated."], ["^✅ Compte « (.+) » et toutes ses données supprimés\\.$", "✅ Account “$1” and all its data deleted."], ["^✅ Sauvegarde créée \\((.+)\\)\\.$", "✅ Backup created ($1)."], ["^✅ (\\d+) connexion\\(s\\) mémorisée\\(s\\) expirée\\(s\\) purgée\\(s\\)\\.$", "✅ $1 expired remembered sign-in(s) purged."], ["^✅ Journal allégé : (\\d+) ligne\\(s\\) ancienne\\(s\\) supprimée\\(s\\)\\.$", "✅ Log trimmed: $1 old line(s) removed."], ["^✅ Index et cours rechargés.*$", "✅ Indexes and courses will be reloaded from disk on each user's next action."]].map(([re, to]) => [new RegExp(re), to]);
+  const EXACT = new Map(I18N.map(([fr, en]) => [fr.trim(), en]));
+  const codeOf = (label) => /English/.test(String(label)) ? 'en' : 'fr';
+  const labelOf = (code) => code === 'en' ? 'English' : 'Français';
   window.__akoriLang = window.__akoriLang || 'fr';
+  const trCore = (t) => {
+    if (EXACT.has(t)) return EXACT.get(t);
+    for (const [re, to] of PATTERNS) if (re.test(t)) return t.replace(re, to);
+    return null;
+  };
   const tr = (frText, lang) => {
     if (lang === 'fr') return frText;
     const key = frText.trim();
-    const out = map[lang].get(key);
-    if (!out) return frText;
-    const lead = frText.match(/^\s*/)[0], trail = frText.match(/\s*$/)[0];
-    return lead + out + trail;
+    if (!key) return frText;
+    let out = trCore(key);
+    if (out === null) {   // préfixe de symboles (⚠️, ✅, ⏳…) devant un message connu
+      const m = key.match(/^([^\p{L}\p{N}'"«]*\s*)([\s\S]+)$/u);
+      if (m && m[1]) { const inner = trCore(m[2]); if (inner !== null) out = m[1] + inner; }
+    }
+    if (out === null) return frText;
+    return frText.match(/^\s*/)[0] + out + frText.match(/\s*$/)[0];
   };
   const SKIP = new Set(['SCRIPT', 'STYLE', 'TEXTAREA', 'IFRAME']);
   const translateTextNode = (node) => {
-    // Reconnaît un texte réécrit par l'application (donc de nouveau en français).
+    // Un texte réécrit par l'application (donc de nouveau en français) est détecté et retraduit.
     if (node.__akLast === undefined || node.nodeValue !== node.__akLast) node.__akFr = node.nodeValue;
     const out = tr(node.__akFr, window.__akoriLang);
     if (node.nodeValue !== out) node.nodeValue = out;
     node.__akLast = node.nodeValue;
   };
   const translateAttrs = (el) => {
-    if (el.placeholder !== undefined && el.tagName && /INPUT|TEXTAREA/.test(el.tagName)) {
-      if (el.__akPh === undefined || (el.placeholder !== el.__akPhLast)) el.__akPh = el.placeholder;
+    if (el.tagName && /^(INPUT|TEXTAREA)$/.test(el.tagName) && el.placeholder) {
+      if (el.__akPh === undefined || el.placeholder !== el.__akPhLast) el.__akPh = el.placeholder;
       const out = tr(el.__akPh, window.__akoriLang);
       if (el.placeholder !== out) el.placeholder = out;
       el.__akPhLast = el.placeholder;
@@ -2206,17 +2564,18 @@ I18N_SRC = r"""
   };
   let pending = false;
   const schedule = (nodes) => {
-    nodes.forEach((n) => (window.__akPendingNodes = window.__akPendingNodes || new Set()).add(n));
+    window.__akPendingNodes = window.__akPendingNodes || new Set();
+    nodes.forEach((n) => window.__akPendingNodes.add(n));
     if (pending) return;
     pending = true;
     requestAnimationFrame(() => {
       pending = false;
-      const set = window.__akPendingNodes || new Set(); window.__akPendingNodes = new Set();
+      const set = window.__akPendingNodes; window.__akPendingNodes = new Set();
       set.forEach((n) => { if (n.isConnected) walk(n); });
     });
   };
   window.__akoriSetLang = (label) => {
-    const code = codeOf(String(label));
+    const code = codeOf(label);
     window.__akoriLang = code;
     try { localStorage.setItem('akori-lang', code); } catch (e) {}
     document.documentElement.lang = code;
@@ -2262,6 +2621,7 @@ THEME_INIT_JS = r"""
       const left = main.parentElement.getBoundingClientRect().left;
       document.documentElement.style.setProperty('--sb-left', Math.max(8, Math.round(left)) + 'px');
     };
+    window.__akoriAlign = alignSidebar;
     alignSidebar();
     window.addEventListener('resize', alignSidebar);
     setTimeout(alignSidebar, 300);
@@ -2279,6 +2639,37 @@ THEME_INIT_JS = r"""
 """
 
 THEME_INIT_JS = THEME_INIT_JS.replace('/*I18N*/', I18N_SRC)
+
+ALIGN_JS = r"""
+() => {
+  document.body.classList.remove('akori-reconnecting');
+  const run = () => window.__akoriAlign && window.__akoriAlign();
+  setTimeout(run, 120); setTimeout(run, 500); setTimeout(run, 1200);
+}
+"""
+
+GET_TOKEN_JS = r"""
+() => {
+  try {
+    const t = localStorage.getItem('akori-token') || '';
+    if (t) document.body.classList.add('akori-reconnecting');
+    return t;
+  } catch (e) { return ''; }
+}
+"""
+
+LOGOUT_JS = r"""
+(t) => { try { return [localStorage.getItem('akori-token') || '']; } catch (e) { return ['']; } }
+"""
+
+TOKEN_STORE_JS = r"""
+(v) => {
+  try {
+    if (v && v.startsWith('set:')) localStorage.setItem('akori-token', v.slice(4));
+    else if (v && v.startsWith('clear:')) localStorage.removeItem('akori-token');
+  } catch (e) {}
+}
+"""
 
 SIDEBAR_TOGGLE_JS = r"""
 () => {
@@ -2309,6 +2700,356 @@ AKORI_NAV_JS = r"""
 
 # Gradio UI
 
+
+# =============================================================================
+# CONNEXION, SESSIONS ET CONSOLE D'ADMINISTRATION
+# =============================================================================
+def _user_badge_html(key):
+    if not key:
+        return ""
+    u = _users().get(key, {})
+    name = u.get("username", key)
+    role = "Administrateur" if u.get("role") == "admin" else "Utilisateur"
+    return (f"<div class='user-badge'><div class='ub-avatar'>{_escape_html(name[:1].upper() or '?')}</div>"
+            f"<div class='ub-text'><b>{_escape_html(name)}</b><span>{role}</span></div></div>")
+
+
+def _views_for(user, status="", token=None):
+    """Tout ce que l'interface doit afficher pour `user` (None = déconnecté)."""
+    tok = _CUR_USER.set(user)
+    try:
+        names = list(documents_db.keys())
+        sel = names[-1] if names else None
+        data = (
+            dashboard_html(sel), documents_html_v16(sel), course_overview_html(sel), course_overview_html(sel),
+            global_progress_html(sel), progress_detail_html(sel), _chat_history_for_ui(sel), history_view(sel),
+        )
+    finally:
+        _CUR_USER.reset(tok)
+    logged = bool(user)
+    admin = logged and _user_role(user) == "admin"
+    return (
+        gr.update(visible=not logged), gr.update(visible=logged), gr.update(visible=False),
+        _user_badge_html(user), gr.update(visible=admin),
+        gr.update(choices=names, value=sel), *data,
+        status, (gr.update() if token is None else token), gr.Tabs(selected="home"),
+    )
+
+
+def do_login(username, password, remember, request: gr.Request):
+    key, msg = _authenticate(username, password)
+    if not key:
+        return _views_for(None, msg)
+    SESSIONS[request.session_hash] = key
+    return _views_for(key, "", f"set:{_issue_token(key)}" if remember else f"clear:{secrets.token_hex(3)}")
+
+
+def do_register(username, password, password2, remember, request: gr.Request):
+    if password != password2:
+        return _views_for(None, "⚠️ Les mots de passe ne correspondent pas.")
+    ok, msg = _create_user(username, password)
+    if not ok:
+        return _views_for(None, msg)
+    return do_login(username, password, remember, request)
+
+
+def do_logout(stored_token, request: gr.Request):
+    key = SESSIONS.pop(request.session_hash, None)
+    _revoke_token(stored_token)
+    _log("logout", key or "")
+    return _views_for(None, "✅ Vous êtes déconnecté.", f"clear:{secrets.token_hex(3)}")
+
+
+def do_auto_login(token, request: gr.Request):
+    key = _user_from_token(token)
+    if not key:
+        return _views_for(None, "", f"clear:{secrets.token_hex(3)}" if token else None)
+    SESSIONS[request.session_hash] = key
+    _log("auto_login", key)
+    return _views_for(key)
+
+
+def _forget_session(request: gr.Request):
+    SESSIONS.pop(request.session_hash, None)
+
+
+def _scoped(fn):
+    """Exécute `fn` pour l'utilisateur connecté de la session (isolation des données entre comptes)."""
+    import functools
+    sig = inspect.signature(fn)
+    params = list(sig.parameters.values())
+    req = inspect.Parameter("request", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None, annotation=gr.Request)
+    new_sig = sig.replace(parameters=[*params, req])
+
+    def _user(args):
+        request = args[-1] if args else None
+        return args[:-1], SESSIONS.get(getattr(request, "session_hash", None))
+
+    if inspect.isgeneratorfunction(fn):
+        @functools.wraps(fn)
+        def wrapper(*args):
+            real, user = _user(args)
+            gen = fn(*real)
+            while True:
+                tok = _CUR_USER.set(user)
+                try:
+                    item = next(gen)
+                except StopIteration:
+                    return
+                finally:
+                    _CUR_USER.reset(tok)
+                yield item
+    else:
+        @functools.wraps(fn)
+        def wrapper(*args):
+            real, user = _user(args)
+            tok = _CUR_USER.set(user)
+            try:
+                return fn(*real)
+            finally:
+                _CUR_USER.reset(tok)
+    wrapper.__signature__ = new_sig
+    wrapper.__annotations__ = {**getattr(fn, "__annotations__", {}), "request": gr.Request}
+    return wrapper
+
+
+# ---------------------------- console d'administration ----------------------------
+ADMIN_USER_HEADERS = ["Utilisateur", "Rôle", "Statut", "Créé le", "Dernière connexion", "Connexions", "Cours", "Échanges", "Quiz", "Stockage"]
+ADMIN_LOG_HEADERS = ["Date", "Événement", "Utilisateur", "Détail"]
+
+
+def _admin_denied():
+    return None if _is_admin() else "⛔ Accès réservé à l'administrateur."
+
+
+def _fmt_duration(seconds):
+    seconds = int(seconds)
+    d, r = divmod(seconds, 86400)
+    h, r = divmod(r, 3600)
+    m = r // 60
+    return (f"{d} j " if d else "") + f"{h} h {m:02d} min"
+
+
+def _admin_overview():
+    users = _users()
+    now = datetime.now()
+    day_ago = (now.timestamp() - 86400)
+
+    def recent(iso):
+        try:
+            return datetime.fromisoformat(iso).timestamp() >= day_ago
+        except Exception:
+            return False
+
+    rows, total_docs, total_size = [], 0, 0
+    for key, u in sorted(users.items()):
+        st = _user_stats(key)
+        total_docs += st["docs"]
+        total_size += st["size"]
+        rows.append([
+            u.get("username", key), "Administrateur" if u.get("role") == "admin" else "Utilisateur",
+            "Actif" if u.get("active", True) else "Désactivé", (u.get("created_at") or "")[:16].replace("T", " "),
+            (u.get("last_login") or "—")[:16].replace("T", " "), int(u.get("logins", 0)),
+            st["docs"], st["chats"], st["quizzes"], _format_file_size(st["size"]),
+        ])
+    active24 = sum(1 for u in users.values() if recent(u.get("last_login", "")))
+    log = _read_log(500)
+    errors24 = sum(1 for r in log if r["event"] in ("error", "gemini_overloaded", "upload_error") and recent(r["t"]))
+    kpis = [
+        (len(users), "Comptes"), (active24, "Actifs (24 h)"), (total_docs, "Cours importés"),
+        (_format_file_size(total_size), "Stockage utilisé"), (session_usage["requests"], "Requêtes IA"),
+        (f"{session_usage['input_tokens'] + session_usage['output_tokens']:,}".replace(",", " "), "Jetons estimés"),
+        (errors24, "Erreurs (24 h)"), (len(SESSIONS), "Sessions en ligne"),
+    ]
+    kpi_html = "<div class='admin-kpis'>" + "".join(
+        f"<div class='admin-kpi{' warn' if label == 'Erreurs (24 h)' and value else ''}'><b>{_escape_html(str(value))}</b><span>{label}</span></div>"
+        for value, label in kpis) + "</div>"
+    service = (
+        "<div class='admin-service'>"
+        f"<div><span>Modèle principal</span><b>{_escape_html(MODEL_NAME)}</b></div>"
+        f"<div><span>Modèles de secours</span><b>{_escape_html(', '.join(_models_chain()[1:]) or '—')}</b></div>"
+        f"<div><span>Clé API Gemini</span><b>{'✅ configurée' if GEMINI_API_KEY else '❌ manquante (GEMINI_API_KEY)'}</b></div>"
+        f"<div><span>Disponibilité</span><b>{_fmt_duration(time.time() - APP_STARTED_AT)}</b></div>"
+        f"<div><span>Dossier de données</span><b>{_escape_html(DATA_DIR)}</b></div>"
+        f"<div><span>Taille PDF maximale</span><b>{int(MAX_PDF_MB)} Mo</b></div>"
+        "</div>"
+    )
+    logs = [[r["t"].replace("T", " "), r["event"], r["user"], r["detail"]] for r in log[:200]]
+    return kpi_html, rows, gr.update(choices=[u.get("username", k) for k, u in sorted(users.items())]), logs, service
+
+
+def _user_stats(key):
+    docs = chats = quizzes = cards = 0
+    root = _user_docs_dir(key)
+    if os.path.isdir(root):
+        for entry in os.listdir(root):
+            meta = _read_json(os.path.join(root, entry, "metadata.json"), None)
+            if not meta:
+                continue
+            docs += 1
+            chats += len([h for h in meta.get("history", []) if h.get("role") == "user"])
+            prog = meta.get("progress", {}) or {}
+            quizzes += len(prog.get("quiz_attempts", []))
+            cards += len(prog.get("flashcards", {}))
+    return {"docs": docs, "chats": chats, "quizzes": quizzes, "cards": cards, "size": _dir_size(os.path.join(USERS_DIR, key))}
+
+
+def _admin_pack(msg=""):
+    return (*_admin_overview(), msg)
+
+
+def admin_open():
+    denied = _admin_denied()
+    if denied:
+        return (gr.update(), gr.update(), *_admin_pack(denied))
+    return (gr.update(visible=False), gr.update(visible=True), *_admin_pack(""))
+
+
+def admin_refresh():
+    denied = _admin_denied()
+    return _admin_pack(denied or "")
+
+
+def _target_key(target):
+    key = str(target or "").strip().lower()
+    return key if key in _users() else None
+
+
+def admin_toggle_active(target):
+    denied = _admin_denied()
+    if denied:
+        return _admin_pack(denied)
+    key = _target_key(target)
+    if not key:
+        return _admin_pack("⚠️ Sélectionnez un utilisateur.")
+    if key == _CUR_USER.get():
+        return _admin_pack("⚠️ Vous ne pouvez pas désactiver votre propre compte.")
+    with _STORE_LOCK:
+        users = _users()
+        users[key]["active"] = not users[key].get("active", True)
+        _write_json(USERS_FILE, users)
+        state = users[key]["active"]
+    if not state:
+        _revoke_user_tokens(key)
+        for sid in [sid for sid, k in SESSIONS.items() if k == key]:
+            SESSIONS.pop(sid, None)
+    _log("admin_toggle", _CUR_USER.get(), f"{key} → {'actif' if state else 'désactivé'}")
+    return _admin_pack(f"✅ Compte « {key} » {'activé' if state else 'désactivé'}.")
+
+
+def admin_reset_password(target, new_password):
+    denied = _admin_denied()
+    if denied:
+        return _admin_pack(denied)
+    key = _target_key(target)
+    if not key:
+        return _admin_pack("⚠️ Sélectionnez un utilisateur.")
+    if len(str(new_password or "")) < 6:
+        return _admin_pack("⚠️ Mot de passe trop court (6 caractères minimum).")
+    with _STORE_LOCK:
+        users = _users()
+        users[key]["salt"], users[key]["hash"] = _hash_password(new_password)
+        _write_json(USERS_FILE, users)
+    _revoke_user_tokens(key)
+    _log("admin_reset_password", _CUR_USER.get(), key)
+    return _admin_pack(f"✅ Mot de passe de « {key} » réinitialisé (ses connexions mémorisées sont révoquées).")
+
+
+def admin_toggle_role(target):
+    denied = _admin_denied()
+    if denied:
+        return _admin_pack(denied)
+    key = _target_key(target)
+    if not key:
+        return _admin_pack("⚠️ Sélectionnez un utilisateur.")
+    users = _users()
+    admins = [k for k, u in users.items() if u.get("role") == "admin"]
+    if users[key].get("role") == "admin":
+        if len(admins) <= 1:
+            return _admin_pack("⚠️ Il doit rester au moins un administrateur.")
+        new_role = "user"
+    else:
+        new_role = "admin"
+    with _STORE_LOCK:
+        users = _users()
+        users[key]["role"] = new_role
+        _write_json(USERS_FILE, users)
+    _log("admin_role", _CUR_USER.get(), f"{key} → {new_role}")
+    return _admin_pack(f"✅ « {key} » est maintenant {'administrateur' if new_role == 'admin' else 'utilisateur'}.")
+
+
+def admin_delete_user(target, confirmed):
+    denied = _admin_denied()
+    if denied:
+        return _admin_pack(denied)
+    key = _target_key(target)
+    if not key:
+        return _admin_pack("⚠️ Sélectionnez un utilisateur.")
+    if key == _CUR_USER.get():
+        return _admin_pack("⚠️ Vous ne pouvez pas supprimer votre propre compte.")
+    if not confirmed:
+        return _admin_pack("⚠️ Cochez la confirmation pour supprimer définitivement ce compte et ses données.")
+    with _STORE_LOCK:
+        users = _users()
+        users.pop(key, None)
+        _write_json(USERS_FILE, users)
+    _revoke_user_tokens(key)
+    for sid in [sid for sid, k in SESSIONS.items() if k == key]:
+        SESSIONS.pop(sid, None)
+    _delete_user_data(key)
+    _log("admin_delete", _CUR_USER.get(), key)
+    return _admin_pack(f"✅ Compte « {key} » et toutes ses données supprimés.")
+
+
+def admin_backup():
+    denied = _admin_denied()
+    if denied:
+        return None, denied
+    base = os.path.join(tempfile.gettempdir(), f"akori_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    path = shutil.make_archive(base, "zip", DATA_DIR)
+    _log("admin_backup", _CUR_USER.get(), os.path.basename(path))
+    return path, f"✅ Sauvegarde créée ({_format_file_size(os.path.getsize(path))})."
+
+
+def admin_reload_indexes():
+    denied = _admin_denied()
+    if denied:
+        return _admin_pack(denied)
+    _USER_DBS.clear()
+    _log("admin_reload", _CUR_USER.get())
+    return _admin_pack("✅ Index et cours rechargés depuis le disque à la prochaine action de chaque utilisateur.")
+
+
+def admin_purge():
+    denied = _admin_denied()
+    if denied:
+        return _admin_pack(denied)
+    with _STORE_LOCK:
+        tokens = _read_json(TOKENS_FILE, {})
+        now = time.time()
+        kept = {h: t for h, t in tokens.items() if t.get("exp", 0) > now}
+        _write_json(TOKENS_FILE, kept)
+    _LOGIN_FAILS.clear()
+    _log("admin_purge", _CUR_USER.get(), f"{len(tokens) - len(kept)} jeton(s) expiré(s)")
+    return _admin_pack(f"✅ {len(tokens) - len(kept)} connexion(s) mémorisée(s) expirée(s) purgée(s).")
+
+
+def admin_trim_log():
+    denied = _admin_denied()
+    if denied:
+        return _admin_pack(denied)
+    try:
+        with _STORE_LOCK:
+            with open(ACTIVITY_LOG, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            with open(ACTIVITY_LOG, "w", encoding="utf-8") as f:
+                f.writelines(lines[-500:])
+        removed = max(0, len(lines) - 500)
+    except OSError:
+        removed = 0
+    return _admin_pack(f"✅ Journal allégé : {removed} ligne(s) ancienne(s) supprimée(s).")
+
+
 theme_akori = gr.themes.Soft(primary_hue="indigo", secondary_hue="purple", neutral_hue="slate")
 
 with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
@@ -2320,156 +3061,223 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
     quiz_validated = gr.State(False)
     quiz_answers = gr.State([])
 
-    with gr.Row(equal_height=False):
-        with gr.Column(scale=1, min_width=60, elem_id="sidebar"):
-            menu_btn = gr.Button("☰", elem_id="sidebar-toggle")
-            gr.HTML("<div class='brand'><div class='brand-mark'>A</div><div><div class='brand-name'>AKORI</div><div class='brand-sub'>Assistant Knowledge Organized to Revise Intelligently</div></div></div>")
-            gr.Markdown("**NAVIGATION**", elem_classes="nav-title")
-            nav_home = gr.Button("Accueil", elem_id="nav-home", elem_classes="navbtn")
-            nav_courses = gr.Button("Mes dossiers", elem_id="nav-courses", elem_classes="navbtn")
-            nav_review = gr.Button("Réviser", elem_id="nav-review", elem_classes="navbtn")
-            nav_flash = gr.Button("Flashcards", elem_id="nav-flash", elem_classes="navbtn")
-            nav_quiz = gr.Button("Quiz / QCM", elem_id="nav-quiz", elem_classes="navbtn")
-            nav_summary = gr.Button("Résumé", elem_id="nav-summary", elem_classes="navbtn")
-            nav_assistant = gr.Button("Assistant IA", elem_id="nav-assistant", elem_classes="navbtn")
-            nav_progress = gr.Button("Progression", elem_id="nav-progress", elem_classes="navbtn")
-            nav_reviewq = gr.Button("À revoir", elem_id="nav-reviewq", elem_classes="navbtn")
-            nav_history = gr.Button("Historique", elem_id="nav-history", elem_classes="navbtn")
-            nav_settings = gr.Button("Paramètres", elem_id="nav-settings", elem_classes="navbtn")
+    # ------------------------------------------------------------ vue : connexion
+    token_in = gr.Textbox(elem_classes="akori-hidden", show_label=False, container=False)
+    token_out = gr.Textbox(elem_classes="akori-hidden", show_label=False, container=False)
 
-        with gr.Column(scale=4, min_width=280, elem_id="main-column"):
-            with gr.Row(elem_id="topbar"):
-                gr.Markdown("### AKORI · Espace de révision")
-                doc_selector = gr.Dropdown(label="Cours actif", choices=list(documents_db.keys()), value=(next(iter(documents_db), None)), scale=2)
+    with gr.Column(visible=True, elem_id="login-view") as login_view:
+        gr.HTML("<div class='login-hero'><div class='brand-mark big'>A</div><h1>AKORI</h1><p>Assistant Knowledge Organized to Revise Intelligently</p></div>")
+        with gr.Column(elem_id="login-card"):
+            gr.HTML("<div class='login-welcome'><h2>Bienvenue sur AKORI</h2><p>Connectez-vous pour retrouver vos cours, flashcards, quiz et historiques archivés.</p></div>")
+            with gr.Tabs(elem_id="auth-tabs"):
+                with gr.Tab("Connexion", id="signin"):
+                    li_user = gr.Textbox(label="Nom d'utilisateur", elem_id="li-user")
+                    li_pass = gr.Textbox(label="Mot de passe", type="password", elem_id="li-pass")
+                    li_remember = gr.Checkbox(label="Rester connecté", value=True)
+                    li_btn = gr.Button("Se connecter", variant="primary", elem_id="li-btn")
+                with gr.Tab("Créer un compte", id="signup"):
+                    su_user = gr.Textbox(label="Nom d'utilisateur", elem_id="su-user")
+                    su_pass = gr.Textbox(label="Mot de passe", type="password", elem_id="su-pass")
+                    su_pass2 = gr.Textbox(label="Confirmer le mot de passe", type="password", elem_id="su-pass2")
+                    su_remember = gr.Checkbox(label="Rester connecté", value=True)
+                    su_btn = gr.Button("Créer mon compte", variant="primary", elem_id="su-btn")
+            login_status = gr.Markdown("", elem_id="login-status")
+            gr.HTML("<div class='login-foot'>Vos données sont enregistrées dans votre compte et restent disponibles à chaque connexion.</div>")
 
-            with gr.Tabs(elem_id="main-tabs") as tabs:
-                with gr.Tab("Accueil", id="home") as tab_home:
-                    home_html = gr.HTML(dashboard_html(doc_selector.value))
-                    start_review = gr.Button("Commencer la révision →", variant="primary")
+    # ------------------------------------------------------------ vue : application
+    with gr.Column(visible=False, elem_id="app-view") as app_view:
+        with gr.Row(equal_height=False):
+            with gr.Column(scale=1, min_width=60, elem_id="sidebar"):
+                menu_btn = gr.Button("☰", elem_id="sidebar-toggle")
+                gr.HTML("<div class='brand'><div class='brand-mark'>A</div><div><div class='brand-name'>AKORI</div><div class='brand-sub'>Assistant Knowledge Organized to Revise Intelligently</div></div></div>")
+                gr.Markdown("**NAVIGATION**", elem_classes="nav-title")
+                nav_home = gr.Button("Accueil", elem_id="nav-home", elem_classes="navbtn")
+                nav_courses = gr.Button("Mes dossiers", elem_id="nav-courses", elem_classes="navbtn")
+                nav_review = gr.Button("Réviser", elem_id="nav-review", elem_classes="navbtn")
+                nav_flash = gr.Button("Flashcards", elem_id="nav-flash", elem_classes="navbtn")
+                nav_quiz = gr.Button("Quiz / QCM", elem_id="nav-quiz", elem_classes="navbtn")
+                nav_summary = gr.Button("Résumé", elem_id="nav-summary", elem_classes="navbtn")
+                nav_assistant = gr.Button("Assistant IA", elem_id="nav-assistant", elem_classes="navbtn")
+                nav_progress = gr.Button("Progression", elem_id="nav-progress", elem_classes="navbtn")
+                nav_reviewq = gr.Button("À revoir", elem_id="nav-reviewq", elem_classes="navbtn")
+                nav_history = gr.Button("Historique", elem_id="nav-history", elem_classes="navbtn")
+                nav_admin = gr.Button("Administration", elem_id="nav-admin", elem_classes="navbtn", visible=False)
+                nav_settings = gr.Button("Paramètres", elem_id="nav-settings", elem_classes="navbtn")
+                nav_logout = gr.Button("Déconnexion", elem_id="nav-logout", elem_classes="navbtn")
+                user_badge = gr.HTML("", elem_id="user-badge")
 
-                with gr.Tab("Mes dossiers", id="courses") as tab_courses:
-                    gr.Markdown("## Mes dossiers")
-                    gr.Markdown("Tous vos supports PDF sont centralisés ici. Dès qu'un document est sélectionné, AKORI extrait son contenu et construit automatiquement son index.")
-                    with gr.Row(elem_id="documents-row", equal_height=True):
-                        docs_html = gr.HTML(documents_html_v16(doc_selector.value), scale=3)
-                        pdf_input = gr.UploadButton(
-                            "＋\nAjouter un document",
-                            file_types=[".pdf"],
-                            file_count="single",
-                            type="filepath",
-                            elem_id="add-document-tile",
-                            scale=1,
-                        )
-                    upload_status = gr.Markdown("Sélectionnez un PDF : extraction et indexation automatiques.", elem_id="upload-status")
-                    gr.Markdown("### Cours actif")
-                    course_info = gr.HTML(course_overview_html(doc_selector.value))
+            with gr.Column(scale=4, min_width=280, elem_id="main-column"):
+                with gr.Row(elem_id="topbar"):
+                    gr.Markdown("### AKORI · Espace de révision")
+                    doc_selector = gr.Dropdown(label="Cours actif", choices=list(documents_db.keys()), value=(next(iter(documents_db), None)), scale=2)
 
-                with gr.Tab("Réviser", id="review") as tab_review:
-                    gr.Markdown("## Réviser ce cours")
-                    gr.Markdown("Une vue centrale pour accéder rapidement au résumé, aux flashcards, au quiz et à l'assistant.")
-                    review_cards = gr.HTML(course_overview_html(doc_selector.value))
-                    with gr.Row():
-                        review_summary = gr.Button("Résumé", variant="secondary")
-                        review_flash = gr.Button("Flashcards", variant="primary")
-                        review_quiz = gr.Button("Quiz / QCM", variant="primary")
-                        review_chat = gr.Button("Assistant IA", variant="secondary")
+                with gr.Tabs(elem_id="main-tabs") as tabs:
+                    with gr.Tab("Accueil", id="home") as tab_home:
+                        home_html = gr.HTML(dashboard_html(doc_selector.value))
+                        start_review = gr.Button("Commencer la révision →", variant="primary")
 
-                with gr.Tab("Flashcards", id="flashcards"):
-                    gr.Markdown("## Flashcards — Mode Roulette")
-                    with gr.Row():
-                        generate_flash = gr.Button("✦ Générer les flashcards", variant="primary")
-                        flash_status = gr.Markdown("", elem_id="flash-status")
-                    flash_view = gr.HTML(flashcard_view([], 0, False))
-                    with gr.Column(visible=False) as flash_actions:
-                        flash_reveal = gr.Button("Afficher la réponse", variant="primary")
+                    with gr.Tab("Mes dossiers", id="courses") as tab_courses:
+                        gr.Markdown("## Mes dossiers")
+                        gr.Markdown("Tous vos supports PDF sont centralisés ici. Dès qu'un document est sélectionné, AKORI extrait son contenu et construit automatiquement son index.")
+                        with gr.Row(elem_id="documents-row", equal_height=True):
+                            docs_html = gr.HTML(documents_html_v16(doc_selector.value), scale=3)
+                            pdf_input = gr.UploadButton(
+                                "＋\nAjouter un document",
+                                file_types=[".pdf"],
+                                file_count="single",
+                                type="filepath",
+                                elem_id="add-document-tile",
+                                scale=1,
+                            )
+                        upload_status = gr.Markdown("Sélectionnez un PDF : extraction et indexation automatiques.", elem_id="upload-status")
+                        gr.Markdown("### Cours actif")
+                        course_info = gr.HTML(course_overview_html(doc_selector.value))
+
+                    with gr.Tab("Réviser", id="review") as tab_review:
+                        gr.Markdown("## Réviser ce cours")
+                        gr.Markdown("Une vue centrale pour accéder rapidement au résumé, aux flashcards, au quiz et à l'assistant.")
+                        review_cards = gr.HTML(course_overview_html(doc_selector.value))
                         with gr.Row():
-                            flash_known = gr.Button("✓ Je savais", variant="primary")
-                            flash_review = gr.Button("↻ À revoir")
+                            review_summary = gr.Button("Résumé", variant="secondary")
+                            review_flash = gr.Button("Flashcards", variant="primary")
+                            review_quiz = gr.Button("Quiz / QCM", variant="primary")
+                            review_chat = gr.Button("Assistant IA", variant="secondary")
 
-                with gr.Tab("Quiz / QCM", id="quiz"):
-                    gr.Markdown("## Quiz d'évaluation")
-                    gr.Markdown("Cliquez sur une réponse, validez, puis passez à la question suivante.")
-                    with gr.Row():
-                        generate_quiz_btn = gr.Button("✦ Générer le quiz", variant="primary")
-                        quiz_restart = gr.Button("🔁 Rejouer")
-                        quiz_status = gr.Markdown("")
-                    quiz_view_box = gr.HTML(quiz_view([], 0))
-                    quiz_choice = gr.Radio(
-                        choices=[], label="Choisissez votre réponse", container=False,
-                        interactive=True, visible=False, elem_classes="quiz-radio-group",
-                    )
-                    with gr.Row():
-                        quiz_validate = gr.Button("Valider la réponse", variant="primary", elem_id="quiz_validate")
-                        quiz_next = gr.Button(NEXT_LABEL, elem_id="quiz_next")
+                    with gr.Tab("Flashcards", id="flashcards"):
+                        gr.Markdown("## Flashcards — Mode Roulette")
+                        with gr.Row():
+                            generate_flash = gr.Button("✦ Générer les flashcards", variant="primary")
+                            flash_status = gr.Markdown("", elem_id="flash-status")
+                        flash_view = gr.HTML(flashcard_view([], 0, False))
+                        with gr.Column(visible=False) as flash_actions:
+                            flash_reveal = gr.Button("Afficher la réponse", variant="primary")
+                            with gr.Row():
+                                flash_known = gr.Button("✓ Je savais", variant="primary")
+                                flash_review = gr.Button("↻ À revoir")
 
-                with gr.Tab("Résumé", id="summary"):
-                    gr.Markdown("## Résumé du cours")
-                    summary_btn = gr.Button("Générer le résumé", variant="primary")
-                    summary_output = gr.Markdown("Sélectionnez un cours puis lancez la génération.")
+                    with gr.Tab("Quiz / QCM", id="quiz"):
+                        gr.Markdown("## Quiz d'évaluation")
+                        gr.Markdown("Cliquez sur une réponse, validez, puis passez à la question suivante.")
+                        with gr.Row():
+                            generate_quiz_btn = gr.Button("✦ Générer le quiz", variant="primary")
+                            quiz_restart = gr.Button("🔁 Rejouer")
+                            quiz_status = gr.Markdown("")
+                        quiz_view_box = gr.HTML(quiz_view([], 0))
+                        quiz_choice = gr.Radio(
+                            choices=[], label="Choisissez votre réponse", container=False,
+                            interactive=True, visible=False, elem_classes="quiz-radio-group",
+                        )
+                        with gr.Row():
+                            quiz_validate = gr.Button("Valider la réponse", variant="primary", elem_id="quiz_validate")
+                            quiz_next = gr.Button(NEXT_LABEL, elem_id="quiz_next")
 
-                with gr.Tab("Assistant IA", id="assistant"):
-                    gr.Markdown("## Assistant AKORI")
-                    gr.Markdown("Posez une question sur le cours actif. Le moteur récupère d'abord les passages pertinents avec FAISS, puis Gemini génère la réponse à partir du contexte récupéré.")
-                    chatbot = gr.Chatbot(
-                        value=_chat_history_for_ui(doc_selector.value) if doc_selector.value else [],
-                        height=470,
-                        elem_id="assistant-chatbot",
-                        render_markdown=True,
-                        line_breaks=True,
-                        latex_delimiters=[
-                            {"left": "$$", "right": "$$", "display": True},
-                            {"left": "$", "right": "$", "display": False},
-                            {"left": "\\[", "right": "\\]", "display": True},
-                            {"left": "\\(", "right": "\\)", "display": False},
-                        ],
-                    )
-                    with gr.Row():
-                        msg_input = gr.Textbox(placeholder="Posez une question sur le cours…", show_label=False, scale=5, elem_id="assistant-input")
-                        send_btn = gr.Button("Envoyer", variant="primary", scale=1, elem_id="assistant-send")
+                    with gr.Tab("Résumé", id="summary"):
+                        gr.Markdown("## Résumé du cours")
+                        summary_btn = gr.Button("Générer le résumé", variant="primary")
+                        summary_output = gr.Markdown("Sélectionnez un cours puis lancez la génération.")
 
-                with gr.Tab("Progression", id="progress"):
-                    gr.Markdown("## Ma progression")
-                    gr.Markdown("Commencez par la vue globale, puis consultez le détail du cours sélectionné.")
-                    global_progress_output = gr.HTML(global_progress_html(doc_selector.value))
-                    gr.Markdown("### Détail du cours sélectionné")
-                    progress_output = gr.HTML(progress_detail_html(doc_selector.value))
+                    with gr.Tab("Assistant IA", id="assistant"):
+                        gr.Markdown("## Assistant AKORI")
+                        gr.Markdown("Posez une question sur le cours actif. Le moteur récupère d'abord les passages pertinents avec FAISS, puis Gemini génère la réponse à partir du contexte récupéré.")
+                        chatbot = gr.Chatbot(
+                            value=_chat_history_for_ui(doc_selector.value) if doc_selector.value else [],
+                            height=470,
+                            elem_id="assistant-chatbot",
+                            render_markdown=True,
+                            line_breaks=True,
+                            latex_delimiters=[
+                                {"left": "$$", "right": "$$", "display": True},
+                                {"left": "$", "right": "$", "display": False},
+                                {"left": "\\[", "right": "\\]", "display": True},
+                                {"left": "\\(", "right": "\\)", "display": False},
+                            ],
+                        )
+                        with gr.Row():
+                            msg_input = gr.Textbox(placeholder="Posez une question sur le cours…", show_label=False, scale=5, elem_id="assistant-input")
+                            send_btn = gr.Button("Envoyer", variant="primary", scale=1, elem_id="assistant-send")
 
-                with gr.Tab("À revoir", id="reviewq"):
-                    gr.Markdown("## À revoir")
-                    gr.Markdown("Cette section regroupera les flashcards marquées « À revoir » et les erreurs de quiz.")
-                    review_queue = gr.HTML("<div class='empty-study'>📌 Votre file « À revoir » apparaîtra ici après les interactions.</div>")
+                    with gr.Tab("Progression", id="progress"):
+                        gr.Markdown("## Ma progression")
+                        gr.Markdown("Commencez par la vue globale, puis consultez le détail du cours sélectionné.")
+                        global_progress_output = gr.HTML(global_progress_html(doc_selector.value))
+                        gr.Markdown("### Détail du cours sélectionné")
+                        progress_output = gr.HTML(progress_detail_html(doc_selector.value))
 
-                with gr.Tab("Paramètres", id="settings"):
-                    gr.Markdown("## Paramètres")
-                    gr.Markdown("Personnalisez AKORI. Vos choix sont mémorisés dans ce navigateur.")
-                    with gr.Row(elem_classes="set-card"):
-                        gr.HTML("<div class='set-text'><div class='set-title'>Mode sombre</div><div class='set-desc'>Basculez entre le thème clair et le thème sombre d'un seul clic.</div></div>")
-                        theme_toggle = gr.Button(" ", elem_id="theme-toggle-btn", scale=0, min_width=84)
-                    with gr.Row(elem_classes="set-card"):
-                        gr.HTML("<div class='set-text'><div class='set-title'>Langue</div><div class='set-desc'>Langue de l'interface et des réponses générées par l'IA.</div></div>")
-                        lang_choice = gr.Radio(choices=LANG_CHOICES, value="Français", show_label=False, container=False, elem_id="lang-choice", scale=0)
+                    with gr.Tab("À revoir", id="reviewq"):
+                        gr.Markdown("## À revoir")
+                        gr.Markdown("Cette section regroupera les flashcards marquées « À revoir » et les erreurs de quiz.")
+                        review_queue = gr.HTML("<div class='empty-study'>📌 Votre file « À revoir » apparaîtra ici après les interactions.</div>")
 
-                with gr.Tab("Historique", id="history"):
-                    gr.Markdown("## Historique du cours actif")
-                    history_box = gr.HTML(history_view(doc_selector.value))
+                    with gr.Tab("Paramètres", id="settings"):
+                        gr.Markdown("## Paramètres")
+                        gr.Markdown("Personnalisez AKORI. Vos choix sont mémorisés dans ce navigateur.")
+                        with gr.Row(elem_classes="set-card"):
+                            gr.HTML("<div class='set-text'><div class='set-title'>Mode sombre</div><div class='set-desc'>Basculez entre le thème clair et le thème sombre d'un seul clic.</div></div>")
+                            theme_toggle = gr.Button(" ", elem_id="theme-toggle-btn", scale=0, min_width=84)
+                        with gr.Row(elem_classes="set-card"):
+                            gr.HTML("<div class='set-text'><div class='set-title'>Langue</div><div class='set-desc'>Langue de l'interface et des réponses générées par l'IA.</div></div>")
+                            lang_choice = gr.Radio(choices=LANG_CHOICES, value="Français", show_label=False, container=False, elem_id="lang-choice", scale=0)
+
+                    with gr.Tab("Historique", id="history"):
+                        gr.Markdown("## Historique du cours actif")
+                        history_box = gr.HTML(history_view(doc_selector.value))
+
+
+    # ------------------------------------------------------------ vue : administration (une seule page)
+    with gr.Column(visible=False, elem_id="admin-view") as admin_view:
+        with gr.Row(elem_id="admin-top"):
+            gr.HTML("<div class='admin-title'><div class='admin-badge'>🛡</div><div><h1>Console d'administration</h1><p>Suivi, maintenance et gestion des comptes AKORI</p></div></div>")
+            admin_refresh_btn = gr.Button("↻ Actualiser", scale=0, min_width=130)
+            admin_back = gr.Button("← Retour à l'application", variant="primary", scale=0, min_width=220)
+        admin_kpis = gr.HTML()
+        with gr.Tabs(elem_id="admin-tabs"):
+            with gr.Tab("Utilisateurs"):
+                admin_table = gr.Dataframe(headers=ADMIN_USER_HEADERS, value=[], interactive=False, wrap=True, elem_id="admin-users")
+                with gr.Row():
+                    admin_user_sel = gr.Dropdown(label="Utilisateur", choices=[], scale=2, elem_id="admin-user-sel")
+                    admin_newpwd = gr.Textbox(label="Nouveau mot de passe", type="password", scale=2, elem_id="admin-newpwd")
+                with gr.Row():
+                    admin_btn_toggle = gr.Button("Activer / Désactiver")
+                    admin_btn_reset = gr.Button("Réinitialiser le mot de passe")
+                    admin_btn_role = gr.Button("Promouvoir / Rétrograder")
+                with gr.Row():
+                    admin_confirm = gr.Checkbox(label="Je confirme la suppression définitive du compte et de ses données", value=False)
+                    admin_btn_delete = gr.Button("Supprimer le compte", variant="stop")
+            with gr.Tab("Activité"):
+                admin_log = gr.Dataframe(headers=ADMIN_LOG_HEADERS, value=[], interactive=False, wrap=True, elem_id="admin-log")
+            with gr.Tab("Maintenance"):
+                admin_service = gr.HTML()
+                with gr.Row():
+                    admin_btn_backup = gr.Button("Sauvegarde complète (ZIP)", variant="primary")
+                    admin_btn_reload = gr.Button("Recharger les index")
+                    admin_btn_purge = gr.Button("Purger les connexions expirées")
+                    admin_btn_trim = gr.Button("Alléger le journal")
+                admin_file = gr.File(label="Sauvegarde", interactive=False)
+        admin_msg = gr.Markdown("", elem_id="admin-msg")
 
     # Upload : la sélection du PDF déclenche directement extraction + chunking + indexation.
     def upload_and_refresh(file_path):
+        """Importe le PDF en affichant l'avancement, puis met à jour toutes les vues d'un coup."""
         file_path = getattr(file_path, "name", file_path)
-        status, selector_update, _ = ajouter_et_indexer_pdf(file_path)
-        selected = os.path.basename(file_path) if file_path else None
-        # The upload event updates every dependent view in one transaction.
-        # Keep the output count exactly aligned with the Gradio listener.
-        return (
-            status, selector_update, documents_html_v16(selected),
+        selected, message = None, ""
+        for event in indexer_pdf_stream(file_path):
+            if event[0] == "status":
+                yield (event[1], *([gr.update()] * 9))
+            else:
+                _, selected, message = event
+        names = list(documents_db.keys())
+        if not selected:
+            yield (message, gr.update(choices=names), *([gr.update()] * 8))
+            return
+        yield (
+            message, gr.update(choices=names, value=selected), documents_html_v16(selected),
             dashboard_html(selected), course_overview_html(selected),
             course_overview_html(selected), global_progress_html(selected),
             progress_detail_html(selected), _chat_history_for_ui(selected),
-            history_view(selected)
+            history_view(selected),
         )
 
-    # Stage 1: immediate visual feedback. Stage 2: extraction + chunking +
-    # embeddings + FAISS, with the selected PDF becoming the active course.
+    # Retour immédiat dès la sélection du PDF, puis import par étapes (extraction, indexation par lots).
     upload_event = pdf_input.upload(
         lambda: "⏳ Analyse du PDF… extraction, découpage et indexation en cours.",
         inputs=None, outputs=[upload_status], queue=False
@@ -2478,7 +3286,7 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
         upload_and_refresh, inputs=[pdf_input],
         outputs=[upload_status, doc_selector, docs_html, home_html, course_info,
                  review_cards, global_progress_output, progress_output, chatbot, history_box],
-        queue=True, show_progress="minimal", concurrency_limit=1
+        queue=True, show_progress="hidden", concurrency_limit=3
     )
 
     def refresh_all(d):
@@ -2515,8 +3323,9 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
     )
     send_event.then(
         repondre_akori_chat_stream,
-        inputs=[pending_message, doc_selector, lang_choice],
+        inputs=[pending_message, doc_selector],
         outputs=[chatbot, pending_message],
+        show_progress="hidden",
     )
 
     submit_event = msg_input.submit(
@@ -2527,8 +3336,9 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
     )
     submit_event.then(
         repondre_akori_chat_stream,
-        inputs=[pending_message, doc_selector, lang_choice],
+        inputs=[pending_message, doc_selector],
         outputs=[chatbot, pending_message],
+        show_progress="hidden",
     )
 
     # Flashcards
@@ -2543,19 +3353,19 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
     )
     flash_reveal.click(
         flashcard_reveal_handler,
-        inputs=[flashcards_state, flash_index, doc_selector],
+        inputs=[flashcards_state, flash_index, doc_selector, lang_choice],
         outputs=[flash_revealed, flash_view],
         queue=False,
     )
     flash_known.click(
-        lambda c, i, d: flashcard_mark_handler(c, i, "known", d),
-        inputs=[flashcards_state, flash_index, doc_selector],
+        lambda c, i, d, lg: flashcard_mark_handler(c, i, "known", d, lg),
+        inputs=[flashcards_state, flash_index, doc_selector, lang_choice],
         outputs=[flash_index, flash_revealed, flash_view, flash_actions, generate_flash],
         queue=False,
     ).then(lambda d: (global_progress_html(d), progress_detail_html(d)), inputs=[doc_selector], outputs=[global_progress_output, progress_output], queue=False)
     flash_review.click(
-        lambda c, i, d: flashcard_mark_handler(c, i, "review", d),
-        inputs=[flashcards_state, flash_index, doc_selector],
+        lambda c, i, d, lg: flashcard_mark_handler(c, i, "review", d, lg),
+        inputs=[flashcards_state, flash_index, doc_selector, lang_choice],
         outputs=[flash_index, flash_revealed, flash_view, flash_actions, generate_flash],
         queue=False,
     ).then(lambda d: (global_progress_html(d), progress_detail_html(d)), inputs=[doc_selector], outputs=[global_progress_output, progress_output], queue=False)
@@ -2589,22 +3399,68 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
     def summary_handler(d, lang=None):
         if not d or d not in documents_db:
             return "⚠️ Sélectionnez d'abord un cours."
+        cache_key = _lang_code(lang)
+        cached = documents_db[d].setdefault("summary_cache", {}).get(cache_key)
+        if cached:
+            return cached
         context = "\n\n".join(preparer_contexte_global(documents_db[d]))
         prompt = f"CONTEXTE DU COURS:\n{context}\n\nDEMANDE: Fais un résumé synthétique des points clés principaux de ce document."
         try:
             response = _gemini_structured(prompt, _with_lang("Tu es AKORI. Résume uniquement les informations présentes dans le contexte fourni. Retourne un JSON {\"summary\":\"...\"}.", lang))
             data = _extract_json_from_text(response)
-            return data.get("summary", response) if isinstance(data, dict) else response
+            result = data.get("summary", response) if isinstance(data, dict) else response
+            documents_db[d]["summary_cache"][cache_key] = result
+            _log("summary", detail=d)
+            return result
         except Exception as e:
+            _log("error", detail=f"summary · {e}")
             return f"⚠️ {e}"
     summary_btn.click(
         lambda: "⏳ Génération du résumé…", outputs=summary_output, queue=False
     ).then(summary_handler, inputs=[doc_selector, lang_choice], outputs=summary_output)
 
-    demo.load(lambda: (dashboard_html(doc_selector.value), documents_html_v16(doc_selector.value), course_overview_html(doc_selector.value), course_overview_html(doc_selector.value), global_progress_html(doc_selector.value), progress_detail_html(doc_selector.value), _chat_history_for_ui(doc_selector.value), history_view(doc_selector.value)), outputs=[home_html, docs_html, course_info, review_cards, global_progress_output, progress_output, chatbot, history_box])
+    # ------------------------------------------------------------ connexion, déconnexion, reconnexion
+    ENTER_OUT = [login_view, app_view, admin_view, user_badge, nav_admin, doc_selector, home_html, docs_html,
+                 course_info, review_cards, global_progress_output, progress_output, chatbot, history_box,
+                 login_status, token_out, tabs]
+    li_btn.click(do_login, [li_user, li_pass, li_remember], ENTER_OUT).then(None, None, None, js=ALIGN_JS)
+    li_pass.submit(do_login, [li_user, li_pass, li_remember], ENTER_OUT).then(None, None, None, js=ALIGN_JS)
+    su_btn.click(do_register, [su_user, su_pass, su_pass2, su_remember], ENTER_OUT).then(None, None, None, js=ALIGN_JS)
+    su_pass2.submit(do_register, [su_user, su_pass, su_pass2, su_remember], ENTER_OUT).then(None, None, None, js=ALIGN_JS)
+    nav_logout.click(do_logout, [token_in], ENTER_OUT, js=LOGOUT_JS).then(None, None, None, js=ALIGN_JS)
+    token_in.change(do_auto_login, [token_in], ENTER_OUT).then(None, None, None, js=ALIGN_JS)
+    token_out.change(None, token_out, None, js=TOKEN_STORE_JS)
+    demo.load(None, None, token_in, js=GET_TOKEN_JS)
+    demo.unload(_forget_session)
+
+    # ------------------------------------------------------------ console d'administration
+    ADMIN_OUT = [admin_kpis, admin_table, admin_user_sel, admin_log, admin_service, admin_msg]
+    nav_admin.click(admin_open, None, [app_view, admin_view] + ADMIN_OUT)
+    admin_back.click(lambda: (gr.update(visible=True), gr.update(visible=False)), None, [app_view, admin_view]).then(None, None, None, js=ALIGN_JS)
+    admin_refresh_btn.click(admin_refresh, None, ADMIN_OUT)
+    admin_btn_toggle.click(admin_toggle_active, [admin_user_sel], ADMIN_OUT)
+    admin_btn_reset.click(admin_reset_password, [admin_user_sel, admin_newpwd], ADMIN_OUT)
+    admin_btn_role.click(admin_toggle_role, [admin_user_sel], ADMIN_OUT)
+    admin_btn_delete.click(admin_delete_user, [admin_user_sel, admin_confirm], ADMIN_OUT)
+    admin_btn_backup.click(admin_backup, None, [admin_file, admin_msg])
+    admin_btn_reload.click(admin_reload_indexes, None, ADMIN_OUT)
+    admin_btn_purge.click(admin_purge, None, ADMIN_OUT)
+    admin_btn_trim.click(admin_trim_log, None, ADMIN_OUT)
+
+# Chaque action s'exécute pour l'utilisateur connecté de la session (données isolées par compte).
+for _bf in list(demo.fns.values()):
+    _fn = getattr(_bf, "fn", None)
+    if _fn is None:
+        continue
+    try:
+        if "request" in inspect.signature(_fn).parameters:
+            continue
+        _bf.fn = _scoped(_fn)
+    except (TypeError, ValueError):
+        continue
 
 if __name__ == "__main__":
-    demo.queue(default_concurrency_limit=4).launch(
+    demo.queue(default_concurrency_limit=4, max_size=64).launch(
         share=True,
         debug=False,
         show_error=False,
