@@ -403,6 +403,11 @@ def _doc_metadata(filename, data):
       "added_at": data.get("added_at", ""),
       "history": data.get("history", []),
       "progress": data.get("progress", {"flashcards": {}, "quiz_attempts": []}),
+      # état des sections de révision de ce PDF (restauré quand on y revient)
+      "flashcards": data.get("flashcards", []),
+      "flash_index": int(data.get("flash_index", 0)),
+      "quiz": data.get("quiz", {}),
+      "summary_cache": data.get("summary_cache", {}),
   }
 
 
@@ -470,6 +475,10 @@ def _load_user_documents(key):
           "content_hash": metadata.get("content_hash", ""),
           "added_at": metadata.get("added_at", ""),
           "progress": metadata.get("progress", {"flashcards": {}, "quiz_attempts": []}),
+          "flashcards": metadata.get("flashcards", []),
+          "flash_index": int(metadata.get("flash_index", 0)),
+          "quiz": metadata.get("quiz", {}),
+          "summary_cache": metadata.get("summary_cache", {}),
       }
     except Exception as e:
       print(f"⚠️ Impossible de restaurer '{entry}' ({key}) : {e}")
@@ -1360,6 +1369,8 @@ Retourne UNIQUEMENT un JSON valide avec la structure exacte suivante :
             f"⚠️ Seulement {len(cards)} flashcard(s) obtenue(s) : il en faut au moins {MIN_FLASHCARDS}. Relancez la génération.")
 
     document["flashcards"] = cards
+    document["flash_index"] = 0
+    _save_history(doc_name)
     _log("flashcards", detail=f"{doc_name} · {len(cards)}")
     view = flashcard_view(cards, 0, False, doc_name, get_flashcard_results(doc_name, cards), lang)
     return (cards, 0, False, view, f"✅ {len(cards)} flashcards prêtes !",
@@ -1399,6 +1410,9 @@ def flashcard_mark_handler(cards, index, mark_type, doc_name, lang=None):
         return index, False, gr.update(), gr.update(visible=False), gr.update(value=REGENERATE_LABEL)
     save_flashcard_result(doc_name, cards[index]["question"], mark_type)
     next_index = index + 1
+    if doc_name in documents_db:
+        documents_db[doc_name]["flash_index"] = next_index
+        _save_history(doc_name)
     results = get_flashcard_results(doc_name, cards)
     if next_index >= len(cards):
         st = flashcard_statistics(cards, results)
@@ -1490,21 +1504,32 @@ def quiz_view(questions, index=0, validated=False, answers=None):
     """
 
 
+def _remember_quiz(doc_name, questions, index, answers, validated):
+    """Conserve l'état du quiz dans le cours (restauré au retour sur ce PDF)."""
+    if doc_name in documents_db:
+        documents_db[doc_name]["quiz"] = {
+            "questions": questions, "index": int(index), "answers": list(answers or []), "validated": bool(validated),
+        }
+        _save_history(doc_name)
+
+
 def quiz_generate_handler(doc_name, lang=None):
     qs, status = generate_quiz_v12(doc_name, lang=lang)
     if qs:
         _log("quiz", detail=f"{doc_name} · {len(qs)}")
+        _remember_quiz(doc_name, qs, 0, [None] * len(qs), False)
     return (qs, 0, False, quiz_view(qs, 0, False, []), status,
             _quiz_radio(qs, 0), [None] * len(qs), gr.update(value=NEXT_LABEL))
 
 
-def quiz_restart_handler(questions):
+def quiz_restart_handler(questions, doc_name=None):
     questions = questions or []
+    _remember_quiz(doc_name, questions, 0, [None] * len(questions), False)
     return (questions, 0, False, quiz_view(questions, 0, False, []), "🔁 Quiz relancé.",
             _quiz_radio(questions, 0), [None] * len(questions), gr.update(value=NEXT_LABEL))
 
 
-def quiz_validate_handler(questions, index, choice, validated, answers):
+def quiz_validate_handler(questions, index, choice, validated, answers, doc_name=None):
     if not questions or int(index) >= len(questions):
         return validated, gr.update(), "⚠️ Générez d'abord un quiz.", answers, gr.update(), gr.update()
     if validated:
@@ -1518,6 +1543,7 @@ def quiz_validate_handler(questions, index, choice, validated, answers):
     ok = int(choice) == int(questions[idx]["answer"])
     status = "✅ Bonne réponse." if ok else "❌ Réponse incorrecte. Consultez l'explication."
     last = idx == len(questions) - 1
+    _remember_quiz(doc_name, questions, idx, answers, True)
     return (True, quiz_view(questions, idx, True, answers), status, answers,
             gr.update(visible=False), gr.update(value=FINISH_LABEL if last else NEXT_LABEL))
 
@@ -1551,6 +1577,7 @@ def quiz_next_handler(questions, index, validated, answers, doc_name):
         return index, False, gr.update(), "⚠️ Validez d'abord cette réponse.", gr.update(), gr.update()
     if index < len(questions) - 1:
         new_index = index + 1
+        _remember_quiz(doc_name, questions, new_index, answers, False)
         return (new_index, False, quiz_view(questions, new_index, False, answers), "",
                 _quiz_radio(questions, new_index), gr.update(value=NEXT_LABEL))
     answers = list(answers or [])
@@ -1563,8 +1590,55 @@ def quiz_next_handler(questions, index, validated, answers, doc_name):
         {"score": score, "total": len(questions), "items": items, "timestamp": datetime.now().isoformat(timespec="seconds")})
     _save_progress(doc_name)
     # index = len(questions) marque le quiz comme terminé (pas de double enregistrement).
+    _remember_quiz(doc_name, questions, len(questions), answers, True)
     return (len(questions), True, quiz_result_view(questions, answers), f"🎯 Quiz terminé : {score}/{len(questions)}.",
             gr.update(choices=[], value=None, visible=False), gr.update(value=NEXT_LABEL))
+
+
+SUMMARY_PLACEHOLDER = "Sélectionnez un cours puis lancez la génération."
+
+
+def _revision_views(doc_name, lang=None):
+    """État des sections Flashcards / Quiz / Résumé du PDF choisi (vierges pour un PDF sans révision)."""
+    data = (documents_db.get(doc_name) if doc_name else None) or {}
+
+    # --- flashcards
+    cards = normalize_flashcards(data.get("flashcards", []))
+    if cards:
+        idx = int(data.get("flash_index", 0))
+        results = get_flashcard_results(doc_name, cards)
+        if idx >= len(cards):
+            st = flashcard_statistics(cards, results)
+            flash = (cards, idx, False, flashcard_end_game_view(doc_name, st["total"], st["known"], st["review"]), "",
+                     gr.update(visible=False), gr.update(value=REGENERATE_LABEL))
+        else:
+            flash = (cards, idx, False, flashcard_view(cards, idx, False, doc_name, results, lang), "",
+                     gr.update(visible=True), gr.update(value=GENERATE_LABEL))
+    else:
+        flash = ([], 0, False, flashcard_view([], 0, False), "", gr.update(visible=False), gr.update(value=GENERATE_LABEL))
+
+    # --- quiz
+    quiz = data.get("quiz") or {}
+    qs = quiz.get("questions") or []
+    hidden_radio = gr.update(choices=[], value=None, visible=False)
+    if qs:
+        n = len(qs)
+        idx = int(quiz.get("index", 0))
+        answers = list(quiz.get("answers") or [None] * n)
+        validated = bool(quiz.get("validated"))
+        if idx >= n:
+            qz = (qs, idx, True, quiz_result_view(qs, answers), "", hidden_radio, answers, gr.update(value=NEXT_LABEL))
+        else:
+            finish = validated and idx == n - 1
+            qz = (qs, idx, validated, quiz_view(qs, idx, validated, answers), "",
+                  hidden_radio if validated else _quiz_radio(qs, idx), answers,
+                  gr.update(value=FINISH_LABEL if finish else NEXT_LABEL))
+    else:
+        qz = ([], 0, False, quiz_view([], 0), "", hidden_radio, [], gr.update(value=NEXT_LABEL))
+
+    # --- résumé
+    summary = (data.get("summary_cache") or {}).get(_lang_code(lang)) or SUMMARY_PLACEHOLDER
+    return (*flash, *qz, summary)
 
 
 def history_view(doc_name):
@@ -3332,26 +3406,33 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
         admin_msg = gr.Markdown("", elem_id="admin-msg")
 
     # Upload : la sélection du PDF déclenche directement extraction + chunking + indexation.
-    def upload_and_refresh(file_path):
+    REVISION_N = 16
+
+    def upload_and_refresh(file_path, lang=None):
         """Importe le PDF en affichant l'avancement, puis met à jour toutes les vues d'un coup."""
         file_path = getattr(file_path, "name", file_path)
         selected, message = None, ""
         for event in indexer_pdf_stream(file_path):
             if event[0] == "status":
-                yield (event[1], *([gr.update()] * 9))
+                yield (event[1], *([gr.update()] * (9 + REVISION_N)))
             else:
                 _, selected, message = event
         names = list(documents_db.keys())
         if not selected:
-            yield (message, gr.update(choices=names), *([gr.update()] * 8))
+            yield (message, gr.update(choices=names), *([gr.update()] * (8 + REVISION_N)))
             return
         yield (
             message, gr.update(choices=names, value=selected), documents_html_v16(selected),
             dashboard_html(selected), course_overview_html(selected),
             course_overview_html(selected), global_progress_html(selected),
             progress_detail_html(selected), _chat_history_for_ui(selected),
-            history_view(selected),
+            history_view(selected), *_revision_views(selected, lang),
         )
+
+    # Sections de révision : leurs composants sont recalculés à chaque changement de PDF.
+    REVISION_OUT = [flashcards_state, flash_index, flash_revealed, flash_view, flash_status, flash_actions, generate_flash,
+                    quiz_state, quiz_index, quiz_validated, quiz_view_box, quiz_status, quiz_choice, quiz_answers, quiz_next,
+                    summary_output]
 
     # Retour immédiat dès la sélection du PDF, puis import par étapes (extraction, indexation par lots).
     upload_event = pdf_input.upload(
@@ -3359,16 +3440,20 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
         inputs=None, outputs=[upload_status], queue=False
     )
     upload_event.then(
-        upload_and_refresh, inputs=[pdf_input],
+        upload_and_refresh, inputs=[pdf_input, lang_choice],
         outputs=[upload_status, doc_selector, docs_html, home_html, course_info,
-                 review_cards, global_progress_output, progress_output, chatbot, history_box],
+                 review_cards, global_progress_output, progress_output, chatbot, history_box] + REVISION_OUT,
         queue=True, show_progress="hidden", concurrency_limit=3
     )
 
-    def refresh_all(d):
-        return dashboard_html(d), documents_html_v16(d), course_overview_html(d), course_overview_html(d), global_progress_html(d), progress_detail_html(d), _chat_history_for_ui(d), history_view(d)
+    def refresh_all(d, lang=None):
+        return (dashboard_html(d), documents_html_v16(d), course_overview_html(d), course_overview_html(d),
+                global_progress_html(d), progress_detail_html(d), _chat_history_for_ui(d), history_view(d),
+                *_revision_views(d, lang))
 
-    doc_selector.change(refresh_all, inputs=[doc_selector], outputs=[home_html, docs_html, course_info, review_cards, global_progress_output, progress_output, chatbot, history_box])
+    doc_selector.change(refresh_all, inputs=[doc_selector, lang_choice],
+                        outputs=[home_html, docs_html, course_info, review_cards, global_progress_output, progress_output,
+                                 chatbot, history_box] + REVISION_OUT)
 
     # Navigation vers les onglets
     nav_home.click(lambda: gr.Tabs(selected="home"), outputs=tabs)
@@ -3402,7 +3487,7 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
         inputs=[pending_message, doc_selector],
         outputs=[chatbot, pending_message],
         show_progress="hidden",
-    )
+    ).then(history_view, inputs=[doc_selector], outputs=[history_box], queue=False)
 
     submit_event = msg_input.submit(
         _ui_chat_user_message,
@@ -3415,7 +3500,7 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
         inputs=[pending_message, doc_selector],
         outputs=[chatbot, pending_message],
         show_progress="hidden",
-    )
+    ).then(history_view, inputs=[doc_selector], outputs=[history_box], queue=False)
 
     # Flashcards
     generate_flash.click(
@@ -3451,10 +3536,10 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
     generate_quiz_btn.click(
         lambda: "⏳ Génération du quiz…", outputs=[quiz_status], queue=False
     ).then(quiz_generate_handler, inputs=[doc_selector, lang_choice], outputs=quiz_outputs, show_progress="minimal")
-    quiz_restart.click(quiz_restart_handler, inputs=[quiz_state], outputs=quiz_outputs, queue=False)
+    quiz_restart.click(quiz_restart_handler, inputs=[quiz_state, doc_selector], outputs=quiz_outputs, queue=False)
     quiz_validate.click(
         quiz_validate_handler,
-        inputs=[quiz_state, quiz_index, quiz_choice, quiz_validated, quiz_answers],
+        inputs=[quiz_state, quiz_index, quiz_choice, quiz_validated, quiz_answers, doc_selector],
         outputs=[quiz_validated, quiz_view_box, quiz_status, quiz_answers, quiz_choice, quiz_next],
         queue=False,
     )
@@ -3486,6 +3571,7 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
             data = _extract_json_from_text(response)
             result = data.get("summary", response) if isinstance(data, dict) else response
             documents_db[d]["summary_cache"][cache_key] = result
+            _save_history(d)
             _log("summary", detail=d)
             return result
         except Exception as e:
