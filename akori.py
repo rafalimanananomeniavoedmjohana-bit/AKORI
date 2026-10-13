@@ -52,7 +52,7 @@ if not GEMINI_API_KEY:
         "L'application démarre, mais les réponses de l'IA échoueront.")
 
 GEMINI_HTTP_TIMEOUT_MS = int(os.getenv("GEMINI_HTTP_TIMEOUT_MS", "25000"))   # durée max d'un appel
-GEMINI_BUDGET_S = float(os.getenv("GEMINI_BUDGET_S", "50"))                 # durée max d'une génération (tous essais)
+GEMINI_BUDGET_S = float(os.getenv("GEMINI_BUDGET_S", "70"))                 # durée max d'une génération (tous essais)
 _client_key = GEMINI_API_KEY or "missing-key"   # sans clé, l'appli démarre quand même (erreur claire à la 1re question)
 try:
     client = genai.Client(api_key=_client_key, http_options=types.HttpOptions(timeout=GEMINI_HTTP_TIMEOUT_MS))
@@ -61,7 +61,7 @@ except Exception:
 MODEL_NAME = "gemini-3.5-flash-lite"
 FALLBACK_MODEL_NAME = "gemini-3.1-flash-lite"  # Secours gratuit, si accessible au projet.
 EXTRA_FALLBACK_MODELS = [
-    m.strip() for m in os.getenv("GEMINI_EXTRA_FALLBACKS", "gemini-2.5-flash-lite").split(",") if m.strip()
+    m.strip() for m in os.getenv("GEMINI_EXTRA_FALLBACKS", "gemini-2.5-flash-lite,gemini-2.5-flash,gemini-2.0-flash").split(",") if m.strip()
 ]
 
 
@@ -72,6 +72,30 @@ def _models_chain():
     if name and name not in chain:
       chain.append(name)
   return chain
+
+_MODEL_COOLDOWN = {}   # modèle -> instant jusqu'auquel on l'évite (surcharge récente) ; inf = modèle inconnu (404)
+_MODEL_LOCK = threading.Lock()
+
+
+def _models_ordered():
+  """Modèles à essayer : d'abord ceux qui répondent bien, ceux récemment surchargés en dernier recours."""
+  now = time.monotonic()
+  with _MODEL_LOCK:
+    healthy = [m for m in _models_chain() if _MODEL_COOLDOWN.get(m, 0) <= now]
+    resting = [m for m in _models_chain() if now < _MODEL_COOLDOWN.get(m, 0) < float("inf")]
+  return healthy + resting
+
+
+def _mark_model(model, code=None):
+  """code=None : le modèle a répondu. 404 : inconnu (écarté). Autre : surchargé, repos de 25 s."""
+  with _MODEL_LOCK:
+    if code is None:
+      _MODEL_COOLDOWN.pop(model, None)
+    elif code == 404:
+      _MODEL_COOLDOWN[model] = float("inf")
+    else:
+      _MODEL_COOLDOWN[model] = time.monotonic() + 25
+
 
 GEMINI_MIN_REQUEST_INTERVAL = float(
     os.getenv("GEMINI_MIN_REQUEST_INTERVAL", "0.3")
@@ -110,8 +134,8 @@ def _embed_device():
 
 EMBED_DEVICE = _embed_device()
 # Seuil de pertinence : similarité cosinus minimale du meilleur passage. En dessous, AKORI répond que
-# l'information n'est pas dans le cours au lieu de laisser Gemini improviser. À calibrer (voir notebook Build).
-MIN_SIMILARITY = float(os.getenv("AKORI_MIN_SIMILARITY", "0.40" if "bge-m3" in EMBED_MODEL_NAME.lower() else "0.20"))
+# l'information n'est pas dans le cours au lieu de laisser Gemini improviser. À calibrer (voir calibrate_similarity).
+MIN_SIMILARITY = float(os.getenv("AKORI_MIN_SIMILARITY", "0.30" if "bge-m3" in EMBED_MODEL_NAME.lower() else "0.18"))
 embed_model = HuggingFaceEmbeddings(
     model_name=EMBED_MODEL_NAME,
     model_kwargs={"device": EMBED_DEVICE},
@@ -121,7 +145,7 @@ embed_model = HuggingFaceEmbeddings(
 print(f"🔎 Embeddings : {EMBED_MODEL_NAME} ({EMBED_DEVICE}) · seuil de pertinence {MIN_SIMILARITY:.2f}")
 if EMBED_DEVICE == "cpu" and "bge-m3" in EMBED_MODEL_NAME.lower():
   print("   ℹ️ Sans GPU, BGE-M3 est lent : activez un GPU dans Colab (Exécution > Modifier le type d'exécution) "
-        "ou faites l'indexation une fois dans le notebook Build.")
+        "ou indexez vos PDF une fois avec `python akori.py --build`.")
 
 
 def _warm_up_embeddings():
@@ -163,11 +187,19 @@ def _is_technology_query(query):
     return any(k in q for k in keys)
 
 
+def _is_overview_query(query):
+    q = _normalize_query(query)
+    keys = ("finalit", "objectif", "but du", "sujet", "de quoi parle", "de quoi traite", "presentation", "présentation",
+            "purpose", "goal", "aim of", "what is this about", "overview")
+    return any(k in q for k in keys)
+
+
 def _is_global_query(query):
     return (
         _is_title_query(query)
         or _is_summary_query(query)
         or _is_technology_query(query)
+        or _is_overview_query(query)
     )
 
 
@@ -467,6 +499,15 @@ def _user_docs_dir(key):
 def _bootstrap_admin():
   """Crée le compte administrateur au premier lancement et migre l'ancien stockage."""
   users = _users()
+  # Accès admin le plus simple : créez un compte normal, puis lancez avec AKORI_ADMIN_USER=<votre e-mail> :
+  # ce compte devient administrateur (aucun mot de passe supplémentaire).
+  wanted = (os.getenv("AKORI_ADMIN_USER") or "").strip().lower()
+  if wanted in users and users[wanted].get("role") != "admin":
+    with _STORE_LOCK:
+      users[wanted]["role"] = "admin"
+      _write_json(USERS_FILE, users)
+    _log("promote_admin", user=wanted, detail="via AKORI_ADMIN_USER")
+    print(f"🛡  « {wanted} » est maintenant administrateur.")
   if not any(u.get("role") == "admin" for u in users.values()):
     name = os.getenv("AKORI_ADMIN_USER", "admin")
     password = os.getenv("AKORI_ADMIN_PASSWORD")
@@ -1103,11 +1144,12 @@ def _source_entry(n, doc, similarity=None):
 
 
 def _stream_gemini(user_prompt, system_instruction, throttle=False):
-  """Flux de texte Gemini. Réessaie / bascule de modèle tant qu'aucun mot n'a été reçu."""
+  """Flux de texte Gemini. Tant qu'aucun mot n'est reçu : on passe aussitôt au modèle de secours suivant,
+  puis on refait un tour complet (jusqu'à 3) après une courte pause, dans la limite du délai global."""
   last_error = None
   deadline = time.monotonic() + GEMINI_BUDGET_S
-  for model_target in _models_chain():
-    for attempt in range(2):
+  for round_no in range(3):
+    for model_target in _models_ordered():
       if time.monotonic() > deadline:
         break
       started = False
@@ -1125,6 +1167,8 @@ def _stream_gemini(user_prompt, system_instruction, throttle=False):
         for chunk in stream:
           text = getattr(chunk, "text", "") or ""
           if text:
+            if not started:
+              _mark_model(model_target)
             started = True
             yield text
         return
@@ -1132,11 +1176,9 @@ def _stream_gemini(user_prompt, system_instruction, throttle=False):
         last_error = e
         if started:
           raise
-        if e.code in (429, 500, 503, 504) and attempt == 0:
-          time.sleep(0.8 + random.uniform(0.0, 0.4))
-          continue
         if e.code in (404, 429, 500, 503, 504):
-          break
+          _mark_model(model_target, e.code)
+          continue
         raise
       except (PermissionError, GeneratorExit, KeyboardInterrupt):
         raise
@@ -1144,8 +1186,11 @@ def _stream_gemini(user_prompt, system_instruction, throttle=False):
         last_error = e
         if started:
           raise
-        print(f"⚠️ {model_target} : {type(e).__name__} ({e}). Nouvel essai.")
-        time.sleep(0.6)
+        print(f"⚠️ {model_target} : {type(e).__name__} ({e}). Modèle suivant.")
+        _mark_model(model_target, "net")
+    if time.monotonic() > deadline:
+      break
+    time.sleep(min(1.2 * (round_no + 1), 3.0) + random.uniform(0.0, 0.4))
   if time.monotonic() > deadline:
     _log("gemini_timeout")
     raise RuntimeError("Gemini met trop de temps à répondre. Réessayez dans un instant.")
@@ -1256,8 +1301,8 @@ def repondre_akori_chat_stream(message_str, doc_selectionne):
     # Garde-fou anti-hallucination : si même le meilleur passage est trop éloigné de la question,
     # on le dit au lieu de laisser Gemini répondre avec ses connaissances générales.
     has_previous = len([m for m in historique[:-2] if m.get("content")]) > 0
-    short_followup = has_previous and len(message_str.split()) < 4
-    if best_similarity is not None and best_similarity < MIN_SIMILARITY and not short_followup:
+    too_short = len(message_str.split()) < 3 or (has_previous and len(message_str.split()) < 4)
+    if best_similarity is not None and best_similarity < MIN_SIMILARITY and not too_short:
       finish_local("ℹ️ The requested information is not in the provided course document."
                    if answer_lang == "en" else
                    "ℹ️ L'information demandée ne figure pas dans le document de cours fourni.")
@@ -1531,17 +1576,12 @@ def _extract_json_from_text(text):
 
 
 def _gemini_structured(prompt, system_instruction, max_tokens=900):
-    """Génération JSON résiliente.
-
-    Chaque modèle est réessayé avec une courte attente progressive en cas de
-    surcharge (503/500) ou de limite (429), puis on bascule sur le modèle de
-    secours suivant. L'erreur n'est montrée qu'une fois tous les essais épuisés.
-    """
-    attempts_per_model = 3
+    """Génération JSON résiliente : modèle de secours aussitôt en cas de surcharge (503/500) ou de limite (429),
+    jusqu'à 3 tours complets avec pause croissante. L'erreur n'est montrée qu'une fois tout épuisé."""
     last_error = None
     deadline = time.monotonic() + GEMINI_BUDGET_S
-    for model_target in _models_chain():
-        for attempt in range(attempts_per_model):
+    for round_no in range(3):
+        for model_target in _models_ordered():
             if time.monotonic() > deadline:
                 break
             try:
@@ -1555,24 +1595,24 @@ def _gemini_structured(prompt, system_instruction, max_tokens=900):
                         response_mime_type="application/json",
                     ),
                 )
+                _mark_model(model_target)
                 return (response.text or "").strip()
             except APIError as e:
                 last_error = e
-                if e.code not in (429, 500, 503, 504):
-                    # Modèle inconnu (404) : on tente directement le suivant ; autre erreur : on remonte.
-                    if e.code == 404:
-                        break
-                    raise
-                if attempt < attempts_per_model - 1:
-                    time.sleep(1.2 * (2 ** attempt) + random.uniform(0.1, 0.5))
-                else:
-                    print(f"⚠️ {model_target} indisponible ({e.code}). Passage au modèle suivant.")
+                if e.code in (404, 429, 500, 503, 504):
+                    _mark_model(model_target, e.code)
+                    print(f"⚠️ {model_target} indisponible ({e.code}). Modèle suivant.")
+                    continue
+                raise
             except (PermissionError, KeyboardInterrupt):
                 raise
-            except Exception as e:  # délai dépassé, coupure réseau… : on réessaie / on change de modèle
+            except Exception as e:  # délai dépassé, coupure réseau… : modèle suivant
                 last_error = e
-                print(f"⚠️ {model_target} : {type(e).__name__} ({e}). Nouvel essai.")
-                time.sleep(0.8)
+                print(f"⚠️ {model_target} : {type(e).__name__} ({e}). Modèle suivant.")
+                _mark_model(model_target, "net")
+        if time.monotonic() > deadline:
+            break
+        time.sleep(min(1.5 * (round_no + 1), 4.0) + random.uniform(0.1, 0.5))
     if time.monotonic() > deadline:
         _log("gemini_timeout")
         raise RuntimeError("Gemini met trop de temps à répondre. Réessayez dans un instant.")
@@ -3210,6 +3250,12 @@ html:root:root:root:root body:has(.akori-dark-page) .gradio-container { backgrou
   background:#141418!important;border:1px solid #26262d!important;border-radius:16px!important;color:#f4f4f6!important;-webkit-text-fill-color:#f4f4f6!important;
   min-height:56px!important;padding:0 20px!important;font-size:16px!important;box-shadow:none!important; }
 .akori-dark-page textarea { padding:16px 20px!important; }
+/* Saisie automatique de Chrome : texte lisible sur fond sombre (sinon e-mail blanc sur fond bleu clair) */
+.akori-dark-page input:-webkit-autofill, .akori-dark-page input:-webkit-autofill:hover, .akori-dark-page input:-webkit-autofill:focus,
+.akori-dark-page input:-webkit-autofill:active { -webkit-text-fill-color:#f4f4f6!important;caret-color:#f4f4f6;
+  box-shadow:0 0 0 1000px #141418 inset!important;-webkit-box-shadow:0 0 0 1000px #141418 inset!important;
+  border:1px solid #26262d!important;transition:background-color 9999s ease-out 0s; }
+.akori-dark-page input:autofill { color:#f4f4f6!important;-webkit-text-fill-color:#f4f4f6!important;box-shadow:0 0 0 1000px #141418 inset!important; }
 .akori-dark-page input::placeholder, .akori-dark-page textarea::placeholder { color:#6c6c78!important;-webkit-text-fill-color:#6c6c78!important; }
 .akori-dark-page input:focus, .akori-dark-page textarea:focus { border-color:#5a5a68!important;outline:none!important; }
 .akori-dark-page .wrap { background:transparent!important;border:0!important; }
@@ -4664,7 +4710,7 @@ def build_library(pdf_dir=None, user=None, password=None, pregenerate=True, lang
     finally:
         _CUR_USER.reset(token)
     _log("build", user=key, detail=f"{len(pdfs)} PDF · {time.time() - started:.0f} s")
-    print(f"✅ Build terminé en {time.time() - started:.0f} s. Lancez maintenant le notebook Demo.")
+    print(f"✅ Build terminé en {time.time() - started:.0f} s. Lancez maintenant AKORI normalement.")
     return key
 
 
