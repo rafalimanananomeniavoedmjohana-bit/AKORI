@@ -496,6 +496,9 @@ def _user_docs_dir(key):
   return os.path.join(USERS_DIR, key, "documents")
 
 
+DEFAULT_ADMIN_PASSWORD = "admin123"   # identifiants par défaut : admin / admin123 (à changer dans la console admin)
+
+
 def _bootstrap_admin():
   """Crée le compte administrateur au premier lancement et migre l'ancien stockage."""
   users = _users()
@@ -508,12 +511,22 @@ def _bootstrap_admin():
       _write_json(USERS_FILE, users)
     _log("promote_admin", user=wanted, detail="via AKORI_ADMIN_USER")
     print(f"🛡  « {wanted} » est maintenant administrateur.")
+  # Ancien compte admin créé avec un mot de passe aléatoire (fichier ADMIN_INITIAL_PASSWORD.txt encore là) :
+  # il repasse aux identifiants par défaut admin / admin123.
+  legacy_note = os.path.join(DATA_DIR, "ADMIN_INITIAL_PASSWORD.txt")
+  if "admin" in users and users["admin"].get("role") == "admin" and os.path.exists(legacy_note):
+    with _STORE_LOCK:
+      users = _users()
+      users["admin"]["salt"], users["admin"]["hash"] = _hash_password(DEFAULT_ADMIN_PASSWORD)
+      users["admin"]["active"] = True
+      _write_json(USERS_FILE, users)
+    with open(legacy_note, "w", encoding="utf-8") as f:
+      f.write(f"Compte administrateur AKORI\nIdentifiant : admin\nMot de passe : {DEFAULT_ADMIN_PASSWORD}\n")
+    print(f"🛡  Compte administrateur : admin / {DEFAULT_ADMIN_PASSWORD}")
   if not any(u.get("role") == "admin" for u in users.values()):
     name = os.getenv("AKORI_ADMIN_USER", "admin")
-    password = os.getenv("AKORI_ADMIN_PASSWORD")
-    generated = not password
-    if generated:
-      password = secrets.token_urlsafe(9)
+    password = os.getenv("AKORI_ADMIN_PASSWORD") or DEFAULT_ADMIN_PASSWORD
+    generated = True
     ok, msg = _create_user(name, password, role="admin", allow_username=True, onboarded=True)
     if ok and generated:
       path = os.path.join(DATA_DIR, "ADMIN_INITIAL_PASSWORD.txt")
@@ -3011,6 +3024,20 @@ html { overflow-y:scroll!important; }
   font-size:13px!important;white-space:nowrap!important;overflow:hidden!important;text-overflow:clip!important;flex:none!important;
   transition:background-color .18s ease, color .18s ease, border-color .18s ease, transform .18s ease!important;
 }
+/* Écrans peu hauts : le menu (avec Administration et Déconnexion) doit tenir sans défilement caché */
+@media (max-height: 900px) {
+  html:root:root #sidebar .navbtn { min-height:35px!important;margin:0!important;font-size:12.5px!important; }
+  html:root:root #sidebar .brand { margin:0 0 6px!important; }
+  html:root:root #sidebar .brand-sub { display:none!important; }
+  html:root:root #sidebar .nav-title { margin:2px 5px 2px!important; }
+  html:root:root #sidebar .user-badge { padding:6px 2px 2px!important; }
+  html:root:root #sidebar #sidebar-toggle { min-height:30px!important; }
+}
+@media (max-height: 740px) {
+  html:root:root #sidebar .navbtn { min-height:30px!important;font-size:12px!important; }
+  html:root:root #sidebar .ub-avatar { width:28px;height:28px; }
+}
+#sidebar::-webkit-scrollbar { width:0; }
 #sidebar .navbtn::before { display:inline-block;width:24px;flex:none;text-align:center;font-size:17px;line-height:1; }
 #sidebar .navbtn:hover { transform:translateX(2px); }
 #sidebar #nav-settings { margin-top:auto!important;border-top:1px solid var(--ak-line)!important; }
