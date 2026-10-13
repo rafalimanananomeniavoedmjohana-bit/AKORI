@@ -27,14 +27,37 @@ from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # --- 1. CONFIGURATION CLIENT GEMINI & EMBEDDINGS ---
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+def _find_gemini_key():
+  """Clé Gemini : variable d'environnement, puis secret Colab, puis saisie masquée dans Colab."""
+  key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
+  if key:
+    return key.strip()
+  try:
+    from google.colab import userdata  # type: ignore
+    key = userdata.get("GEMINI_API_KEY") or ""
+  except Exception:
+    key = ""
+  if not key and "google.colab" in sys.modules and "ipykernel" in sys.modules:
+    try:
+      import getpass
+      key = getpass.getpass("🔑 Clé API Gemini (https://aistudio.google.com/apikey) : ")
+    except Exception:
+      key = ""
+  return key.strip()
+
+
+GEMINI_API_KEY = _find_gemini_key()
+if not GEMINI_API_KEY:
+  print("⚠️ Aucune clé Gemini : ajoutez le secret Colab GEMINI_API_KEY (icône clé) ou la variable d'environnement. "
+        "L'application démarre, mais les réponses de l'IA échoueront.")
 
 GEMINI_HTTP_TIMEOUT_MS = int(os.getenv("GEMINI_HTTP_TIMEOUT_MS", "25000"))   # durée max d'un appel
 GEMINI_BUDGET_S = float(os.getenv("GEMINI_BUDGET_S", "50"))                 # durée max d'une génération (tous essais)
+_client_key = GEMINI_API_KEY or "missing-key"   # sans clé, l'appli démarre quand même (erreur claire à la 1re question)
 try:
-    client = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=GEMINI_HTTP_TIMEOUT_MS))
+    client = genai.Client(api_key=_client_key, http_options=types.HttpOptions(timeout=GEMINI_HTTP_TIMEOUT_MS))
 except Exception:
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    client = genai.Client(api_key=_client_key)
 MODEL_NAME = "gemini-3.5-flash-lite"
 FALLBACK_MODEL_NAME = "gemini-3.1-flash-lite"  # Secours gratuit, si accessible au projet.
 EXTRA_FALLBACK_MODELS = [
