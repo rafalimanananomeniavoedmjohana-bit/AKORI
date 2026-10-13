@@ -4719,12 +4719,18 @@ def _cli_arg(name, default=None):
     return default
 
 
-if __name__ == "__main__" and "--build" in sys.argv:
-    build_library(pdf_dir=_cli_arg("--pdfs"), user=_cli_arg("--user"), password=_cli_arg("--password"),
-                  pregenerate="--no-pregenerate" not in sys.argv)
-    sys.exit(0)
+_BUILD_MODE = __name__ == "__main__" and ("--build" in sys.argv or os.getenv("AKORI_MODE") == "build")
 
-if __name__ == "__main__":
+if _BUILD_MODE:
+    build_library(
+        pdf_dir=_cli_arg("--pdfs") or os.getenv("AKORI_PDF_DIR"),
+        user=_cli_arg("--user"), password=_cli_arg("--password"),
+        pregenerate="--no-pregenerate" not in sys.argv,
+        langs=tuple(x.strip() for x in os.getenv("AKORI_BUILD_LANGS", "fr,en").split(",") if x.strip()),
+    )
+    if "--build" in sys.argv:
+        sys.exit(0)
+elif __name__ == "__main__":
     threading.Thread(target=_prewarm_demo, daemon=True).start()
     demo.queue(default_concurrency_limit=4, max_size=64).launch(
         share=True,
