@@ -85,14 +85,53 @@ EXTRA_FALLBACK_MODELS = [
 ]
 
 
-def _models_chain():
-  """Modèle principal puis modèles de secours, sans doublon."""
-  chain = []
-  for name in [MODEL_NAME, FALLBACK_MODEL_NAME, *EXTRA_FALLBACK_MODELS]:
-    if name and name not in chain:
-      chain.append(name)
-  return chain
+_AVAILABLE_MODELS = None   # modèles réellement proposés par la clé (None = pas encore découverts)
 
+
+def _version_key(name):
+  nums = re.findall(r"\d+(?:\.\d+)?", name)
+  return float(nums[0]) if nums else 0.0
+
+
+def _discover_models():
+  """Interroge Gemini pour connaître les modèles « flash » réellement disponibles avec cette clé.
+  Les modèles retirés (404) sont alors écartés et les plus récents ajoutés aux modèles de secours."""
+  global _AVAILABLE_MODELS
+  if not GEMINI_KEY_OK or not GEMINI_API_KEY:
+    return None
+  try:
+    found = []
+    for m in client.models.list():
+      name = str(getattr(m, "name", "") or "").replace("models/", "")
+      actions = list(getattr(m, "supported_actions", None) or [])
+      low = name.lower()
+      if not low.startswith("gemini-") or "flash" not in low:
+        continue
+      if actions and "generateContent" not in actions:
+        continue
+      if any(x in low for x in ("embed", "image", "tts", "live", "audio", "robotics", "computer", "native", "aqa", "customtools")):
+        continue
+      found.append(name)
+    if found:
+      _AVAILABLE_MODELS = sorted(set(found), key=lambda n: (-_version_key(n), "lite" not in n.lower(), n))
+      print(f"🤖 Modèles Gemini disponibles : {', '.join(_AVAILABLE_MODELS[:8])}")
+    return _AVAILABLE_MODELS
+  except Exception as e:
+    print(f"⚠️ Liste des modèles Gemini indisponible : {type(e).__name__}")
+    return None
+
+
+def _models_chain():
+  """Modèles configurés encore disponibles, puis les autres modèles « flash » découverts, sans doublon."""
+  configured = [m for m in (MODEL_NAME, FALLBACK_MODEL_NAME, *EXTRA_FALLBACK_MODELS) if m]
+  if _AVAILABLE_MODELS:
+    chain = [m for m in configured if m in _AVAILABLE_MODELS]
+    chain += [m for m in _AVAILABLE_MODELS if m not in chain][:6]
+    if chain:
+      return list(dict.fromkeys(chain))
+  return list(dict.fromkeys(configured))
+
+threading.Thread(target=lambda: _discover_models(), daemon=True).start()   # sans bloquer le démarrage
 _MODEL_COOLDOWN = {}   # modèle -> instant jusqu'auquel on l'évite (surcharge récente) ; inf = modèle inconnu (404)
 _MODEL_LOCK = threading.Lock()
 
@@ -1403,6 +1442,8 @@ def _stream_gemini(user_prompt, system_instruction, throttle=False):
     raise RuntimeError("Gemini met trop de temps à répondre. Réessayez dans un instant.")
   text = _gemini_fail_text(errors)
   _log("gemini_overloaded", detail=text[-120:])
+  if any(c == 404 for _, c in errors):
+    threading.Thread(target=_discover_models, daemon=True).start()   # les noms de modèles ont peut-être changé
   raise RuntimeError(text)
 
 
@@ -4379,7 +4420,11 @@ def admin_test_gemini():
     denied = _admin_denied()
     if denied:
         return _admin_pack(denied)
-    lines = ["| Modèle | Résultat | Détail |", "|---|---|---|"]
+    available = _discover_models()
+    lines = []
+    if available:
+        lines.append("Modèles « flash » disponibles avec cette clé : " + ", ".join(available[:12]) + "\n")
+    lines += ["| Modèle | Résultat | Détail |", "|---|---|---|"]
     if not GEMINI_KEY_OK:
         lines.append("| — | ❌ clé invalide | La clé contient des caractères non autorisés (accents, symboles) : collez la clé exacte AIza… |")
     elif not GEMINI_API_KEY:
@@ -4393,8 +4438,8 @@ def admin_test_gemini():
                 lines.append(f"| {model} | ✅ répond | {(time.monotonic() - started) * 1000:.0f} ms |")
                 _mark_model(model)
             except APIError as e:
-                hint = {429: "quota épuisé (par minute ou par jour)", 404: "modèle inconnu pour cette clé",
-                        503: "serveur surchargé", 500: "erreur serveur", 400: "requête ou clé invalide",
+                hint = {429: "quota épuisé (par minute ou par jour)", 404: "modèle inconnu ou retiré pour cette clé",
+                        503: "serveur surchargé", 504: "délai dépassé (serveur lent)", 500: "erreur serveur", 400: "requête ou clé invalide",
                         401: "clé refusée", 403: "accès refusé à ce modèle"}.get(e.code, "erreur")
                 lines.append(f"| {model} | ❌ {e.code} | {hint} |")
             except Exception as e:
