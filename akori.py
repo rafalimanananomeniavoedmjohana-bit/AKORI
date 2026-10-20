@@ -73,11 +73,102 @@ def _require_gemini_key():
 
 GEMINI_HTTP_TIMEOUT_MS = int(os.getenv("GEMINI_HTTP_TIMEOUT_MS", "25000"))   # durée max d'un appel
 GEMINI_BUDGET_S = float(os.getenv("GEMINI_BUDGET_S", "70"))                 # durée max d'une génération (tous essais)
+def _make_client(key):
+    try:
+        return genai.Client(api_key=key, http_options=types.HttpOptions(timeout=GEMINI_HTTP_TIMEOUT_MS))
+    except Exception:
+        return genai.Client(api_key=key)
+
+
+def _extra_gemini_keys():
+    """Clés de secours : GEMINI_API_KEYS (séparées par des virgules) ou GEMINI_API_KEY_2…5 (variables ou secrets Colab)."""
+    raw = [os.getenv("GEMINI_API_KEYS") or ""] + [os.getenv(f"GEMINI_API_KEY_{i}") or "" for i in range(2, 6)]
+    try:
+        from google.colab import userdata  # type: ignore
+        for name in ["GEMINI_API_KEYS"] + [f"GEMINI_API_KEY_{i}" for i in range(2, 6)]:
+            try:
+                raw.append(userdata.get(name) or "")
+            except Exception:
+                pass
+    except Exception:
+        pass
+    keys = []
+    for chunk in raw:
+        for part in re.split(r"[,;\s]+", chunk):
+            key = _clean_key(part)
+            if key and key.isascii() and key != GEMINI_API_KEY and key not in keys:
+                keys.append(key)
+    return keys[:4]
+
+
+class _MultiClient:
+    """Plusieurs clés Gemini (projets différents = quotas différents) : une clé à bout de quota (429) est mise
+    au repos 60 s et l'appel repart aussitôt avec la suivante. Même interface que genai.Client pour .models."""
+
+    def __init__(self, clients):
+        self.clients = clients
+        self._rest = {}
+        self._lock = threading.Lock()
+        self.models = self._Models(self)
+
+    def _order(self):
+        now = time.monotonic()
+        with self._lock:
+            ready = [i for i in range(len(self.clients)) if self._rest.get(i, 0) <= now]
+            resting = [i for i in range(len(self.clients)) if self._rest.get(i, 0) > now]
+        return ready + resting
+
+    def _cool(self, index, seconds=60):
+        with self._lock:
+            self._rest[index] = time.monotonic() + seconds
+
+    class _Models:
+        def __init__(self, owner):
+            self.o = owner
+
+        def generate_content(self, **kw):
+            last = None
+            for i in self.o._order():
+                try:
+                    return self.o.clients[i].models.generate_content(**kw)
+                except APIError as e:
+                    if e.code != 429:
+                        raise
+                    self.o._cool(i)
+                    last = e
+            raise last
+
+        def generate_content_stream(self, **kw):
+            def gen():
+                last = None
+                for i in self.o._order():
+                    try:
+                        iterator = iter(self.o.clients[i].models.generate_content_stream(**kw))
+                        first = next(iterator)
+                    except StopIteration:
+                        return
+                    except APIError as e:
+                        if e.code != 429:
+                            raise
+                        self.o._cool(i)
+                        last = e
+                        continue
+                    yield first
+                    yield from iterator
+                    return
+                raise last
+            return gen()
+
+        def list(self, *a, **kw):
+            return self.o.clients[0].models.list(*a, **kw)
+
+
 _client_key = GEMINI_API_KEY or "missing-key"   # sans clé, l'appli démarre quand même (erreur claire à la 1re question)
-try:
-    client = genai.Client(api_key=_client_key, http_options=types.HttpOptions(timeout=GEMINI_HTTP_TIMEOUT_MS))
-except Exception:
-    client = genai.Client(api_key=_client_key)
+client = _make_client(_client_key)
+_EXTRA_KEYS = _extra_gemini_keys() if GEMINI_API_KEY else []
+if _EXTRA_KEYS:
+    client = _MultiClient([client] + [_make_client(k) for k in _EXTRA_KEYS])
+    print(f"🔑 {1 + len(_EXTRA_KEYS)} clés Gemini : bascule automatique en cas de quota atteint.")
 MODEL_NAME = "gemini-3.5-flash-lite"
 FALLBACK_MODEL_NAME = "gemini-3.1-flash-lite"  # Secours gratuit, si accessible au projet.
 EXTRA_FALLBACK_MODELS = [
@@ -661,6 +752,7 @@ def _doc_metadata(filename, data):
       "file_size": int(data.get("file_size", 0)),
       "content_hash": data.get("content_hash", ""),
       "added_at": data.get("added_at", ""),
+      "answer_cache": data.get("answer_cache", {}),
       "embed_model": data.get("embed_model", EMBED_MODEL_NAME),
       "ocr_pages": int(data.get("ocr_pages", 0) or 0),
       "pins": data.get("pins", []),
@@ -742,6 +834,7 @@ def _load_user_documents(key):
         rebuild = (lambda k=key, f=filename, p=index_path, e=doc_entry: _rebuild_index_for(k, f, p, e))
       vector_db = _LazyVectorStore(index_path, rebuild)
       doc_entry.update({
+          "answer_cache": metadata.get("answer_cache", {}),
           "embed_model": model_used,
           "ocr_pages": int(metadata.get("ocr_pages", 0) or 0),
           "pins": metadata.get("pins", []),
@@ -1214,6 +1307,7 @@ def indexer_pdf_stream(file_path):
     documents_db[filename] = {
         "vector_db": vector_db,
         "embed_model": EMBED_MODEL_NAME,
+        "answer_cache": dict(keep.get("answer_cache", {})),
         "ocr_pages": ocr_pages,
         "pins": list(keep.get("pins", [])),
         "history": list(keep.get("history", [])),
@@ -1533,6 +1627,20 @@ def repondre_akori_chat_stream(message_str, doc_selectionne):
       yield from _with_heartbeat(lazy._load, lambda sec: (_chat_history_for_ui(doc_selectionne), ""))
       item["content"] = "⏳ Génération…"
 
+    # Réponse déjà calculée (cache sur Drive) : instantanée et sans appel Gemini, même si l'API est saturée.
+    cache_key = _normalize_query(message_str)
+    cached = (doc_data.get("answer_cache") or {}).get(cache_key)
+    if cached and cached.get("content"):
+      item["content"] = cached["content"]
+      item["sources"] = list(cached.get("sources") or [])
+      item["timing"] = {"search": 0, "first": 0, "total": round((time.monotonic() - t_start) * 1000), "cached": True}
+      item.pop("streaming", None)
+      session_usage["requests"] += 1
+      _save_history(doc_selectionne)
+      _log("chat_cached", detail=f"{doc_selectionne} · {len(item['content'])} car.", total_ms=item["timing"]["total"])
+      yield _chat_history_for_ui(doc_selectionne), ""
+      return
+
     best_similarity = None
     if _is_global_query(message_str):
       retrieved = [(doc, None) for doc in _global_docs(doc_data)]
@@ -1606,19 +1714,39 @@ def repondre_akori_chat_stream(message_str, doc_selectionne):
     MIN_STREAM_CHARS = 10
     MAX_STREAM_DELAY = 0.05
 
-    for texte_chunk in _stream_gemini(user_prompt, system_instruction):
-      if t_first is None:
-        t_first = time.monotonic() - t_start
-      reponse += texte_chunk
-      buffer += texte_chunk
-      now = time.monotonic()
+    try:
+      for texte_chunk in _stream_gemini(user_prompt, system_instruction):
+        if t_first is None:
+          t_first = time.monotonic() - t_start
+        reponse += texte_chunk
+        buffer += texte_chunk
+        now = time.monotonic()
 
-      if len(buffer) >= MIN_STREAM_CHARS or (now - last_ui_update) >= MAX_STREAM_DELAY:
-        item["content"] = reponse
-        buffer = ""
-        last_ui_update = now
-        # L'historique précédent reste affiché ; seul le dernier message évolue.
-        yield _chat_history_for_ui(doc_selectionne), ""
+        if len(buffer) >= MIN_STREAM_CHARS or (now - last_ui_update) >= MAX_STREAM_DELAY:
+          item["content"] = reponse
+          buffer = ""
+          last_ui_update = now
+          # L'historique précédent reste affiché ; seul le dernier message évolue.
+          yield _chat_history_for_ui(doc_selectionne), ""
+    except RuntimeError as gemini_error:
+      if reponse:
+        raise
+      # Gemini indisponible : on ne laisse pas l'étudiant sans rien, on affiche les passages du cours trouvés.
+      _log("chat_fallback", detail=str(gemini_error)[:120], search_ms=round(t_search * 1000))
+      intro = ("ℹ️ The AI is temporarily unavailable. Here are the passages of the course closest to your question:"
+               if answer_lang == "en" else
+               "ℹ️ L'IA est momentanément indisponible. Voici les passages du cours les plus proches de votre question :")
+      parts = [intro, ""]
+      for c in candidates[:3]:
+        where = _source_label(c)
+        parts.append(f"**{c['n']}. {where[:1].upper() + where[1:]}**  \n{c['excerpt']}")
+        parts.append("")
+      item["content"] = "\n".join(parts).strip()
+      item["sources"] = []
+      item.pop("streaming", None)
+      _save_history(doc_selectionne)
+      yield _chat_history_for_ui(doc_selectionne), ""
+      return
 
     t_total = time.monotonic() - t_start
     # Sources : les passages cités par la réponse ([1], [2]…), sinon tous les passages utilisés.
@@ -1629,6 +1757,11 @@ def repondre_akori_chat_stream(message_str, doc_selectionne):
                       "total": round(t_total * 1000)}
     item["content"] = reponse or "…"
     item.pop("streaming", None)
+    if reponse and len(message_str.split()) >= 3:
+      store = doc_data.setdefault("answer_cache", {})
+      store[cache_key] = {"content": reponse, "sources": shown, "t": datetime.now().isoformat(timespec="seconds")}
+      while len(store) > 150:
+        store.pop(next(iter(store)))
     session_usage["output_tokens"] += _estimate_tokens(reponse)
     session_usage["requests"] += 1
     _save_history(doc_selectionne)
@@ -5030,6 +5163,19 @@ def build_library(pdf_dir=None, user=None, password=None, pregenerate=True, lang
                     if qs:
                         entry["quiz"] = {"questions": qs, "index": 0, "answers": [None] * len(qs), "validated": False}
                     print(f"   📝 {name} : {status}")
+                demo_questions = [q.strip() for q in os.getenv("AKORI_DEMO_QUESTIONS", "").split("|") if q.strip()] or [
+                    "De quoi parle ce cours ?", "Quelles sont les notions principales de ce cours ?",
+                    "Quel est l'objectif de ce document ?"]
+                for question in demo_questions:
+                    before = len(entry["history"])
+                    try:
+                        list(_ui_chat_user_message(question, [], name))
+                        for _ in repondre_akori_chat_stream(question, name):
+                            pass
+                        print(f"   💬 {name} : réponse mémorisée « {question[:50]} »")
+                    except Exception as e:
+                        print(f"   ⚠️ {name} : question de démonstration impossible : {e}")
+                    del entry["history"][before:]          # l'historique de démonstration reste vierge ; la réponse est en cache
                 for lang in langs:
                     cache = entry.setdefault("summary_cache", {})
                     if not cache.get(lang):
