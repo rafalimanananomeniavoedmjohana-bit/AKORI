@@ -1,4 +1,5 @@
 import contextvars
+import io
 import traceback
 import secrets
 import hashlib
@@ -936,21 +937,42 @@ def _save_progress(filename):
   _save_history(filename)
 
 
-def _course_progress_percent(filename):
-  if not filename or filename not in documents_db:
-    return 0
+def _course_stats(filename):
+  """Toutes les mesures d'un cours, calculées au même endroit pour que chaque vue affiche les mêmes chiffres.
+
+  Progression du cours = moyenne de 3 activités (flashcards, quiz, colle orale). Une activité non commencée
+  compte pour 0 % : on ne peut donc pas avoir « 0 quiz terminé » et une bonne moyenne de quiz."""
+  doc = documents_db.get(filename) or {}
   progress = _progress_for(filename)
   flash = progress.get("flashcards", {})
   known = sum(1 for v in flash.values() if v == "known")
-  flash_total = len(flash)
+  review = sum(1 for v in flash.values() if v == "review")
+  series = len(doc.get("flashcards") or [])
+  cards_total = max(series, len(flash))
+  flash_pct = round(known / cards_total * 100) if cards_total else 0
   attempts = progress.get("quiz_attempts", [])
-  quiz_pct = (sum(float(a.get("score", 0)) / max(1, int(a.get("total", 1))) for a in attempts) / len(attempts) * 100) if attempts else 0
-  components = []
-  if flash_total:
-    components.append((known / flash_total) * 100)
-  if attempts:
-    components.append(quiz_pct)
-  return round(sum(components) / len(components)) if components else 0
+  q_points = sum(int(a.get("score", 0)) for a in attempts)
+  q_total = sum(int(a.get("total", 0)) for a in attempts)
+  quiz_pct = round(q_points / q_total * 100) if q_total else 0
+  oral = progress.get("oral_attempts", [])
+  oral_avg = (sum(float(a.get("score", 0)) for a in oral) / len(oral)) if oral else 0
+  oral_pct = round(oral_avg * 10)
+  history = doc.get("history", []) or []
+  return {
+      "flash_known": known, "flash_review": review, "flash_total": cards_total, "flash_answered": len(flash), "flash_pct": flash_pct,
+      "quizzes": len(attempts), "quiz_pct": quiz_pct, "quiz_questions": q_total,
+      "orals": len(oral), "oral_avg": oral_avg, "oral_pct": oral_pct,
+      "questions": sum(1 for m in history if isinstance(m, dict) and m.get("role") == "user"),
+      "summary": bool(doc.get("summary_cache")), "pins": len(doc.get("pins", []) or []),
+      "started": sum(1 for v in (len(flash), len(attempts), len(oral)) if v),
+      "percent": round((flash_pct + quiz_pct + oral_pct) / 3),
+  }
+
+
+def _course_progress_percent(filename):
+  if not filename or filename not in documents_db:
+    return 0
+  return _course_stats(filename)["percent"]
 
 
 def _progress_topics(filename):
@@ -967,30 +989,60 @@ def _progress_topics(filename):
 
 def _global_progress_stats():
   if not documents_db:
-    return {"percent": 0, "courses": 0, "started": 0, "flashcards": 0, "known": 0, "quizzes": 0, "quiz_avg": 0}
-  values = [_course_progress_percent(name) for name in documents_db]
-  quiz_points = quiz_total = all_flash = all_known = all_quizzes = 0
+    return {"percent": 0, "courses": 0, "started": 0, "flashcards": 0, "known": 0, "quizzes": 0, "quiz_avg": None,
+            "orals": 0, "oral_avg": None, "questions": 0}
+  all_stats = [_course_stats(name) for name in documents_db]
+  q_pts = q_tot = 0
   for name in documents_db:
-    prog = _progress_for(name)
-    flash = prog.get("flashcards", {})
-    all_flash += len(flash)
-    all_known += sum(1 for state in flash.values() if state == "known")
-    attempts = prog.get("quiz_attempts", [])
-    all_quizzes += len(attempts)
-    for attempt in attempts:
-      quiz_points += int(attempt.get("score", 0))
-      quiz_total += int(attempt.get("total", 0))
-  return {"percent": round(sum(values)/len(values)) if values else 0, "courses": len(documents_db), "started": sum(1 for v in values if v > 0), "flashcards": all_flash, "known": all_known, "quizzes": all_quizzes, "quiz_avg": round((quiz_points/quiz_total)*100) if quiz_total else 0}
+    for a in _progress_for(name).get("quiz_attempts", []):
+      q_pts += int(a.get("score", 0))
+      q_tot += int(a.get("total", 0))
+  orals = sum(st["orals"] for st in all_stats)
+  oral_sum = sum(st["oral_avg"] * st["orals"] for st in all_stats)
+  return {"percent": round(sum(st["percent"] for st in all_stats) / len(all_stats)), "courses": len(all_stats),
+          "started": sum(1 for st in all_stats if st["started"]),
+          "flashcards": sum(st["flash_total"] for st in all_stats), "known": sum(st["flash_known"] for st in all_stats),
+          "quizzes": sum(st["quizzes"] for st in all_stats), "quiz_avg": round(q_pts / q_tot * 100) if q_tot else None,
+          "orals": orals, "oral_avg": (oral_sum / orals) if orals else None, "questions": sum(st["questions"] for st in all_stats)}
+
+
+def _pct_or_dash(value, has_data):
+  return f"{value}%" if has_data else "—"
+
+
+def _flash_caption(st):
+  if not st["flash_total"]:
+    return "Pas encore commencé : générez une série dans Flashcards."
+  extra = f" · {st['flash_review']} à revoir" if st["flash_review"] else ""
+  return f"{st['flash_known']} maîtrisée(s) sur {st['flash_total']}{extra}"
+
+
+def _quiz_caption(st):
+  if not st["quizzes"]:
+    return "Pas encore commencé : terminez un quiz pour obtenir une moyenne."
+  return f"{st['quizzes']} quiz terminé(s) · moyenne {st['quiz_pct']} % sur {st['quiz_questions']} questions"
+
+
+def _oral_caption(st):
+  if not st["orals"]:
+    return "Pas encore commencé : lancez une colle orale."
+  return f"{st['orals']} colle(s) · moyenne {st['oral_avg']:.1f}/10"
+
 
 def global_progress_html(active_doc=None):
   if not documents_db:
     return """<div class='progress-empty'><b>Votre progression commencera ici.</b><br>Importez un cours pour créer votre premier suivi. Tant qu'aucun cours n'est chargé, la progression reste à 0 %.</div>"""
-  st = _global_progress_stats(); rows=[]
-  for name,data in documents_db.items():
-    cp=_course_progress_percent(name); active=" active-progress-course" if name==active_doc else ""
-    rows.append(f"<div class='global-course-row{active}'><div class='global-course-main'><span class='global-course-dot'></span><div><b>{_escape_html(data.get('title') or name)}</b><small>{_escape_html(name)}</small></div></div><div class='global-course-bar'><div style='width:{cp}%;'></div></div><strong>{cp}%</strong></div>")
-  pct=st['percent']
-  return f"""<div class='global-progress-hero'><div class='global-progress-ring' style='--progress:{pct}%;'><span>{pct}%</span></div><div class='global-progress-copy'><div class='eyebrow'>VUE D'ENSEMBLE</div><h2>Progression globale</h2><p>Synthèse de tous vos cours réellement importés et de vos interactions de révision.</p></div></div><div class='global-metrics'><div><b>{st['courses']}</b><span>Cours suivis</span></div><div><b>{st['started']}</b><span>Cours commencés</span></div><div><b>{st['known']}/{st['flashcards']}</b><span>Flashcards maîtrisées</span></div><div><b>{st['quiz_avg']}%</b><span>Moyenne des quiz</span></div></div><div class='global-course-list'><div class='global-list-title'>Progression par cours</div>{''.join(rows)}</div><div class='global-detail-hint'>Le détail pédagogique reste lié au cours sélectionné : points forts, points faibles, flashcards et résultats des quiz.</div>"""
+  st = _global_progress_stats(); rows = []
+  for name, data in documents_db.items():
+    cs = _course_stats(name); cp = cs["percent"]; active = " active-progress-course" if name == active_doc else ""
+    detail = (f"Flashcards {_pct_or_dash(cs['flash_pct'], cs['flash_total'])} · Quiz {_pct_or_dash(cs['quiz_pct'], cs['quizzes'])}"
+              f" · Colle {_pct_or_dash(cs['oral_pct'], cs['orals'])}")
+    rows.append(f"<div class='global-course-row{active}'><div class='global-course-main'><span class='global-course-dot'></span><div><b>{_escape_html(data.get('title') or name)}</b><small>{_escape_html(name)}</small><small class='gc-detail'>{detail}</small></div></div><div class='global-course-bar'><div style='width:{cp}%;'></div></div><strong>{cp}%</strong></div>")
+  pct = st['percent']
+  quiz_avg = f"{st['quiz_avg']}%" if st['quiz_avg'] is not None else "—"
+  oral_avg = f"{st['oral_avg']:.1f}/10" if st['oral_avg'] is not None else "—"
+  return f"""<div class='global-progress-hero'><div class='global-progress-ring' style='--progress:{pct}%;'><span class='cu'>{pct}%</span></div><div class='global-progress-copy'><div class='eyebrow'>VUE D'ENSEMBLE</div><h2>Progression globale</h2><p>Moyenne de la progression de tous vos cours. Chaque cours compte 3 activités (flashcards, quiz, colle orale) : une activité non commencée compte pour 0 %.</p></div></div><div class='global-metrics'><div><b>{st['courses']}</b><span>Cours importés</span><small>dans votre espace</small></div><div><b>{st['started']}</b><span>Cours commencés</span><small>au moins une activité faite</small></div><div><b>{st['known']}/{st['flashcards']}</b><span>Flashcards maîtrisées</span><small>tous cours confondus</small></div><div><b>{quiz_avg}</b><span>Moyenne des quiz</span><small>{st['quizzes']} quiz terminé(s), tous cours</small></div><div><b>{oral_avg}</b><span>Moyenne des colles</span><small>{st['orals']} colle(s), tous cours</small></div></div><div class='global-course-list'><div class='global-list-title'>Progression par cours</div>{''.join(rows)}</div><div class='global-detail-hint'>Le détail pédagogique reste lié au cours sélectionné : activités, points forts, points faibles et prochaine étape.</div>"""
+
 
 def progress_detail_html(active_doc=None):
   if not documents_db:
@@ -998,39 +1050,55 @@ def progress_detail_html(active_doc=None):
   if not active_doc or active_doc not in documents_db:
     active_doc = next(iter(documents_db))
   data = documents_db[active_doc]
-  progress = _progress_for(active_doc)
-  pct = _course_progress_percent(active_doc)
-  flash = progress.get("flashcards", {})
-  known = sum(1 for v in flash.values() if v == "known")
-  review = sum(1 for v in flash.values() if v == "review")
-  attempts = progress.get("quiz_attempts", [])
-  total_questions = sum(int(a.get("total", 0)) for a in attempts)
-  total_correct = sum(int(a.get("score", 0)) for a in attempts)
-  quiz_avg = round((total_correct / total_questions) * 100) if total_questions else 0
+  cs = _course_stats(active_doc)
+  pct = cs["percent"]
   topics = _progress_topics(active_doc)
-  strengths = [(t, round(v["correct"] / v["total"] * 100)) for t,v in topics.items() if v["total"] and v["correct"] / v["total"] >= .75]
-  weaknesses = [(t, round(v["correct"] / v["total"] * 100)) for t,v in topics.items() if v["total"] and v["correct"] / v["total"] < .60]
+  strengths = [(t, round(v["correct"] / v["total"] * 100)) for t, v in topics.items() if v["total"] and v["correct"] / v["total"] >= .75]
+  weaknesses = [(t, round(v["correct"] / v["total"] * 100)) for t, v in topics.items() if v["total"] and v["correct"] / v["total"] < .60]
   if not topics:
     strengths_html = "<div class='progress-note'>Pas encore assez de réponses de quiz pour identifier un point fort.</div>"
     weaknesses_html = "<div class='progress-note'>Pas encore assez de réponses de quiz pour identifier un point faible.</div>"
   else:
-    strengths_html = "".join(f"<div class='strength-row'><span>{_escape_html(t)}</span><b>{score}%</b></div>" for t,score in sorted(strengths,key=lambda x:-x[1])) or "<div class='progress-note'>Aucun point fort clairement établi pour le moment.</div>"
-    weaknesses_html = "".join(f"<div class='weakness-row'><span>{_escape_html(t)}</span><b>{score}%</b></div>" for t,score in sorted(weaknesses,key=lambda x:x[1])) or "<div class='progress-note'>Aucun point faible clairement établi pour le moment.</div>"
+    strengths_html = "".join(f"<div class='strength-row'><span>{_escape_html(t)}</span><b>{score}%</b></div>" for t, score in sorted(strengths, key=lambda x: -x[1])) or "<div class='progress-note'>Aucun point fort clairement établi pour le moment.</div>"
+    weaknesses_html = "".join(f"<div class='weakness-row'><span>{_escape_html(t)}</span><b>{score}%</b></div>" for t, score in sorted(weaknesses, key=lambda x: x[1])) or "<div class='progress-note'>Aucun point faible clairement établi pour le moment.</div>"
+
+  def activity(title, icon, value, started, caption, target):
+    shown = f"{value}%" if started else "—"
+    state = "act-on" if started else "act-off"
+    return (f"<div class='act-row {state}'><div class='act-head'><span class='act-name'>{icon} {title}</span><b>{shown}</b></div>"
+            f"<div class='act-bar'><i style='width:{value if started else 0}%'></i></div>"
+            f"<div class='act-foot'><small>{_escape_html(caption)}</small>"
+            f"<button type='button' class='ak-act ak-go ak-t-{target}'>▶ <span>{'Continuer' if started else 'Commencer'}</span></button></div></div>")
+
+  activities = (
+      activity("Flashcards", "🎰", cs["flash_pct"], cs["flash_total"] > 0 and cs["flash_answered"] > 0, _flash_caption(cs), "flash")
+      + activity("Quiz / QCM", "🎯", cs["quiz_pct"], cs["quizzes"] > 0, _quiz_caption(cs), "quiz")
+      + activity("Colle orale", "🎤", cs["oral_pct"], cs["orals"] > 0, _oral_caption(cs), "oral"))
+  if not cs["flash_answered"]:
+    nxt = ("Générez vos flashcards pour commencer à mémoriser.", "flash", "Flashcards")
+  elif not cs["quizzes"]:
+    nxt = ("Terminez un quiz pour mesurer ce que vous retenez.", "quiz", "Quiz / QCM")
+  elif not cs["orals"]:
+    nxt = ("Passez une colle orale pour vous entraîner à expliquer le cours.", "oral", "Colle orale")
+  elif cs["flash_review"]:
+    nxt = (f"Revoyez vos {cs['flash_review']} flashcard(s) marquée(s) « à revoir ».", "flash", "Flashcards")
+  else:
+    nxt = ("Bravo : les trois activités sont lancées. Continuez pour monter vers 100 %.", "assistant", "Assistant IA")
+  info = (f"<div class='info-chips'><span><b>{cs['questions']}</b> question(s) posée(s) à l'assistant</span>"
+          f"<span>Résumé : <b>{'généré' if cs['summary'] else 'non généré'}</b></span>"
+          f"<span><b>{cs['pins']}</b> chapitre(s) épinglé(s) dans À revoir</span></div>")
   return f"""
   <div class='progress-hero'>
-    <div class='progress-ring'><span>{pct}%</span></div>
-    <div><div class='progress-title'>Progression réelle · {_escape_html(data.get('title') or active_doc)}</div>
-    <div class='progress-sub'>Calculée uniquement à partir des interactions enregistrées sur ce cours.</div></div>
+    <div class='progress-ring'><span class='cu'>{pct}%</span></div>
+    <div><div class='progress-title'>Progression du cours · {_escape_html(data.get('title') or active_doc)}</div>
+    <div class='progress-sub'>Moyenne de 3 activités : flashcards, quiz et colle orale ({cs['started']}/3 commencées). Une activité non commencée compte pour 0 %.</div></div>
   </div>
-  <div class='progress-metrics'>
-    <div><b>{known}</b><span>Flashcards maîtrisées</span></div>
-    <div><b>{review}</b><span>À revoir</span></div>
-    <div><b>{quiz_avg}%</b><span>Moyenne des quiz</span></div>
-    <div><b>{len(attempts)}</b><span>Quiz terminés</span></div>
-  </div>
+  <div class='act-list'>{activities}</div>
+  {info}
+  <div class='next-step'><div><span class='eyebrow'>PROCHAINE ÉTAPE</span><p>{nxt[0]}</p></div><button type='button' class='ak-act ak-go ak-t-{nxt[1]}'>▶ <span>{nxt[2]}</span></button></div>
   <div class='progress-columns'>
-    <div class='progress-box'><h3>✦ Points forts</h3>{strengths_html}</div>
-    <div class='progress-box'><h3>↗ Points faibles</h3>{weaknesses_html}</div>
+    <div class='progress-box'><h3>✦ Points forts</h3><small class='progress-src'>d'après vos réponses de quiz sur ce cours</small>{strengths_html}</div>
+    <div class='progress-box'><h3>↗ Points faibles</h3><small class='progress-src'>d'après vos réponses de quiz sur ce cours</small>{weaknesses_html}</div>
   </div>
   """
 
@@ -1890,32 +1958,47 @@ def dashboard_html(active_doc=None):
     if not cards:
         cards = "<div class='empty-state'>📚 Aucun cours pour le moment.<br><span>Importez votre premier PDF dans 'Mes dossiers' pour commencer.</span></div>"
 
+    active_chunks = int(active.get("chunks_count", 0)) if active else 0
+    stats = _course_stats(active_doc) if active_doc in documents_db else None
+    questions_here = stats["questions"] if stats else 0
+    questions_all = sum(_course_stats(n)["questions"] for n in documents_db) if documents_db else 0
+    pct = stats["percent"] if stats else 0
+    cards_guide = [
+        ("courses", "📁", "Mes dossiers", "Importez vos PDF, même scannés : AKORI lit le texte, le découpe et l'indexe.", "Importer un PDF"),
+        ("summary", "📚", "Résumé", "Les points clés du cours en un coup d'œil, dans votre langue.", "Générer le résumé"),
+        ("assistant", "✦", "Assistant IA", "Posez vos questions : la réponse s'appuie sur votre cours, avec la page citée. Épinglez ou écoutez-la.", "Poser une question"),
+        ("flash", "🎰", "Flashcards", "Au moins 7 cartes en mode roulette : cliquez pour stopper, la réponse s'efface à chaque relance.", "Lancer la roulette"),
+        ("quiz", "🎯", "Quiz / QCM", "Testez-vous : correction expliquée, points forts et faibles dans Progression.", "Passer un quiz"),
+        ("oral", "🎤", "Colle orale", "Répondez à l'oral ou à l'écrit : note sur 10 d'après votre cours et page à relire.", "Passer une colle"),
+        ("reviewq", "📌", "À revoir", "Retrouvez les réponses que vous avez épinglées, cours par cours.", "Ouvrir À revoir"),
+    ]
+    guide = "".join(
+        f"<button type='button' class='guide-card ak-go ak-t-{t}' style='--i:{i}'><span class='gc-ico'>{ico}</span>"
+        f"<span class='gc-body'><b>{title}</b><span>{desc}</span><em>{cta} →</em></span></button>"
+        for i, (t, ico, title, desc, cta) in enumerate(cards_guide))
+
     return f"""
     <div class='hero'>
       <div>
         <div class='eyebrow'>ASSISTANT KNOWLEDGE ORGANIZED TO REVISE INTELLIGENTLY</div>
         <h1>{greeting}<br><span>Prêt à booster votre révision ?</span></h1>
-        <p class='home-slogan'>AKORI transforme vos cours PDF en un espace de révision intelligent : résumé, flashcards roulette, quiz et assistant RAG.</p>
+        <p class='home-slogan'>AKORI transforme vos cours PDF en un espace de révision intelligent : résumé, flashcards roulette, quiz, colle orale et assistant RAG.</p>
       </div>
       <div class='hero-orb'>✦</div>
     </div>
-    <div class='guide-box'>
-      <h3>💡 Guide de révision AKORI &amp; mode roulette flashcards</h3>
-      <div class='guide-grid'>
-        <div class='guide-item'><b>1. Chargez vos dossiers</b><span>Glissez vos PDF dans Mes dossiers pour activer l'indexation FAISS.</span></div>
-        <div class='guide-item'><b>2. Lancement roulette</b><span>Générez au moins 7 flashcards. Les questions défilent automatiquement en boucle.</span></div>
-        <div class='guide-item'><b>3. Clic &amp; réponse effacée</b><span>Cliquez sur la carte pour stopper/relancer. La réponse s'efface à chaque relance.</span></div>
-      </div>
-    </div>
     <div class='stat-row'>
-      <div class='mini-stat'><b>{total_docs}</b><span>Cours importés</span></div>
-      <div class='mini-stat'><b>{total_chunks}</b><span>Fragments indexés</span></div>
-      <div class='mini-stat'><b>{len(active.get('history', [])) // 2 if active else 0}</b><span>Échanges du cours</span></div>
-      <div class='mini-stat'><b>RAG</b><span>Recherche active</span></div>
+      <div class='mini-stat'><b class='cu'>{total_docs}</b><span>Cours importés</span><small>dans votre espace</small></div>
+      <div class='mini-stat'><b class='cu'>{active_chunks}</b><span>Passages indexés</span><small>dans le cours actif ({total_chunks} au total)</small></div>
+      <div class='mini-stat'><b class='cu'>{questions_here}</b><span>Questions posées</span><small>à l'assistant sur ce cours ({questions_all} sur tous vos cours)</small></div>
+      <div class='mini-stat'><b class='cu'>{pct}%</b><span>Progression du cours actif</span><small>flashcards, quiz et colle orale</small></div>
+    </div>
+    <div class='guide-box'>
+      <h3>💡 Guide de révision : que faire avec chaque fonction ?</h3>
+      <div class='guide-grid'>{guide}</div>
     </div>
     <div class='section-head'><div><h2>Réviser un cours en un clic</h2><p>Générez les outils principaux à partir du cours actif.</p></div></div>
     <div class='revision-banner'>
-      <div><strong>{_escape_html(active_title)}</strong><br><span>Résumé · Flashcards · Quiz / QCM · Assistant IA</span></div>
+      <div><strong>{_escape_html(active_title)}</strong><br><span>Résumé · Flashcards · Quiz / QCM · Colle orale · Assistant IA</span></div>
       <span class='revision-chip'>Cours actif</span>
     </div>
     <div class='section-head'><div><h2>Mes cours</h2><p>Vos supports de révision indexés localement.</p></div></div>
@@ -1931,8 +2014,8 @@ def course_overview_html(active_doc=None):
     <div class='course-overview'>
       <div class='course-overview-title'>{_escape_html(data.get('title') or active_doc)}</div>
       <div class='course-overview-file'>{_escape_html(active_doc)}</div>
-      <div class='course-overview-meta'>{int(data.get('chunks_count',0))} fragments indexés · Progression {progress}% · RAG local</div>
-      <div class='course-overview-actions'>Résumé · Flashcards · Quiz / QCM · Assistant IA</div>
+      <div class='course-overview-meta'>{int(data.get('chunks_count',0))} passages indexés · Progression du cours {progress}%</div>
+      <div class='course-overview-actions'>Résumé · Flashcards · Quiz / QCM · Colle orale · Assistant IA</div>
     </div>
     """
 
@@ -3575,7 +3658,7 @@ html:root:root:root:root body.akori-dark iframe { filter:invert(.92) hue-rotate(
 body { --sb-w:var(--sb-open); --main-ml:calc(var(--sb-open) + 16px); }
 body.sidebar-collapsed { --sb-w:var(--sb-rail); --main-ml:calc(var(--sb-rail) + 16px); }
 /* survol du rail : le menu s'ouvre et la page glisse en même temps (même durée, même courbe) */
-body.sidebar-collapsed:has(#sidebar:hover) { --sb-w:var(--sb-open); --main-ml:calc(var(--sb-open) + 16px); }
+body.sidebar-collapsed.sb-hover { --sb-w:var(--sb-open); --main-ml:calc(var(--sb-open) + 16px); }
 
 /* mise en page stable : toutes les pages ont la même largeur, barre de défilement toujours présente */
 html { overflow-y:scroll!important; }
@@ -3628,7 +3711,7 @@ html { overflow-y:scroll!important; }
 }
 #sidebar .html-container, #sidebar .prose { padding:0!important;max-width:none!important; }
 #sidebar .nav-title { transition:opacity .2s ease; }
-body.sidebar-collapsed:not(:has(#sidebar:hover)) #sidebar .nav-title { opacity:0; }
+body.sidebar-collapsed:not(.sb-hover) #sidebar .nav-title { opacity:0; }
 #sidebar .brand { display:flex!important;align-items:center;gap:11px;width:100%;margin:2px 0 14px!important;padding-left:3px;overflow:hidden;white-space:nowrap; }
 #sidebar .brand-mark { flex:none!important;width:42px!important;min-width:42px!important;height:42px!important; }
 #sidebar .brand > div:last-child { flex:none;width:170px; }
@@ -3639,10 +3722,10 @@ body.sidebar-collapsed:not(:has(#sidebar:hover)) #sidebar .nav-title { opacity:0
 /* écrans étroits : rail fixe, ouverture en surimpression (pas la place de pousser la page) */
 @media (max-width:900px) {
   :root { --sb-left:10px; }
-  body, body.sidebar-collapsed, body.sidebar-collapsed:has(#sidebar:hover) { --sb-w:var(--sb-rail); --main-ml:calc(var(--sb-rail) + 12px); }
+  body, body.sidebar-collapsed, body.sidebar-collapsed.sb-hover { --sb-w:var(--sb-rail); --main-ml:calc(var(--sb-rail) + 12px); }
   body:not(.sidebar-collapsed) { --sb-w:var(--sb-open); }
-  body:not(.sidebar-collapsed) #sidebar, body.sidebar-collapsed:has(#sidebar:hover) #sidebar { box-shadow:0 14px 40px rgba(30,41,80,.2)!important; }
-  body.sidebar-collapsed:has(#sidebar:hover) { --sb-w:var(--sb-open); }
+  body:not(.sidebar-collapsed) #sidebar, body.sidebar-collapsed.sb-hover #sidebar { box-shadow:0 14px 40px rgba(30,41,80,.2)!important; }
+  body.sidebar-collapsed.sb-hover { --sb-w:var(--sb-open); }
   .gradio-container { padding:6px!important; }
   .gradio-container .main { padding-left:6px!important;padding-right:6px!important; }
 }
@@ -3750,6 +3833,58 @@ html:root:root:root:root body.akori-dark #lang-choice label:has(input:checked) {
 #sidebar #nav-settings::before { content:""!important;width:20px!important;height:20px!important;font-size:0!important;background:currentColor!important;-webkit-mask:url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%20fill='none'%20stroke='black'%20stroke-width='1.9'%20stroke-linecap='round'%20stroke-linejoin='round'%3E%3Ccircle%20cx='12'%20cy='12'%20r='3'/%3E%3Cpath%20d='M19.4%2015a1.7%201.7%200%200%200%20.3%201.8l.1.1a2%202%200%201%201-2.8%202.8l-.1-.1a1.7%201.7%200%200%200-1.8-.3%201.7%201.7%200%200%200-1%201.5V21a2%202%200%201%201-4%200v-.1a1.7%201.7%200%200%200-1.1-1.5%201.7%201.7%200%200%200-1.8.3l-.1.1a2%202%200%201%201-2.8-2.8l.1-.1a1.7%201.7%200%200%200%20.3-1.8%201.7%201.7%200%200%200-1.5-1H3a2%202%200%201%201%200-4h.1a1.7%201.7%200%200%200%201.5-1.1%201.7%201.7%200%200%200-.3-1.8l-.1-.1a2%202%200%201%201%202.8-2.8l.1.1a1.7%201.7%200%200%200%201.8.3H9a1.7%201.7%200%200%200%201-1.5V3a2%202%200%201%201%204%200v.1a1.7%201.7%200%200%200%201%201.5%201.7%201.7%200%200%200%201.8-.3l.1-.1a2%202%200%201%201%202.8%202.8l-.1.1a1.7%201.7%200%200%200-.3%201.8V9a1.7%201.7%200%200%200%201.5%201H21a2%202%200%201%201%200%204h-.1a1.7%201.7%200%200%200-1.5%201z'/%3E%3C/svg%3E") center/contain no-repeat!important;mask:url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%20fill='none'%20stroke='black'%20stroke-width='1.9'%20stroke-linecap='round'%20stroke-linejoin='round'%3E%3Ccircle%20cx='12'%20cy='12'%20r='3'/%3E%3Cpath%20d='M19.4%2015a1.7%201.7%200%200%200%20.3%201.8l.1.1a2%202%200%201%201-2.8%202.8l-.1-.1a1.7%201.7%200%200%200-1.8-.3%201.7%201.7%200%200%200-1%201.5V21a2%202%200%201%201-4%200v-.1a1.7%201.7%200%200%200-1.1-1.5%201.7%201.7%200%200%200-1.8.3l-.1.1a2%202%200%201%201-2.8-2.8l.1-.1a1.7%201.7%200%200%200%20.3-1.8%201.7%201.7%200%200%200-1.5-1H3a2%202%200%201%201%200-4h.1a1.7%201.7%200%200%200%201.5-1.1%201.7%201.7%200%200%200-.3-1.8l-.1-.1a2%202%200%201%201%202.8-2.8l.1.1a1.7%201.7%200%200%200%201.8.3H9a1.7%201.7%200%200%200%201-1.5V3a2%202%200%201%201%204%200v.1a1.7%201.7%200%200%200%201%201.5%201.7%201.7%200%200%200%201.8-.3l.1-.1a2%202%200%201%201%202.8%202.8l-.1.1a1.7%201.7%200%200%200-.3%201.8V9a1.7%201.7%200%200%200%201.5%201H21a2%202%200%201%201%200%204h-.1a1.7%201.7%200%200%200-1.5%201z'/%3E%3C/svg%3E") center/contain no-repeat!important; }
 #sidebar #nav-logout::before { content:""!important;width:20px!important;height:20px!important;font-size:0!important;background:currentColor!important;-webkit-mask:url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%20fill='none'%20stroke='black'%20stroke-width='1.9'%20stroke-linecap='round'%20stroke-linejoin='round'%3E%3Cpath%20d='M9%2021H5a2%202%200%200%201-2-2V5a2%202%200%200%201%202-2h4'/%3E%3Cpolyline%20points='16%2017%2021%2012%2016%207'/%3E%3Cline%20x1='21'%20y1='12'%20x2='9'%20y2='12'/%3E%3C/svg%3E") center/contain no-repeat!important;mask:url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%20fill='none'%20stroke='black'%20stroke-width='1.9'%20stroke-linecap='round'%20stroke-linejoin='round'%3E%3Cpath%20d='M9%2021H5a2%202%200%200%201-2-2V5a2%202%200%200%201%202-2h4'/%3E%3Cpolyline%20points='16%2017%2021%2012%2016%207'/%3E%3Cline%20x1='21'%20y1='12'%20x2='9'%20y2='12'/%3E%3C/svg%3E") center/contain no-repeat!important; }
 .akori-hidden { display:none!important; }
+html:root:root:root:root body.sb-instant #sidebar, html:root:root:root:root body.sb-instant #main-column,
+html:root:root:root:root body.sb-instant #sidebar * { transition:none!important; }
+html:root:root:root:root { --sb-dur:.16s; }
+#user-badge { cursor:pointer; } #user-badge:hover .ub-text b { color:var(--ak-blue); }
+#user-badge .ub-avatar { transition:transform .2s ease; } #user-badge:hover .ub-avatar { transform:scale(1.08); }
+img.ub-avatar, img.ad-avatar { object-fit:cover; }
+.prof-card { display:flex;align-items:center;gap:20px;border:1px solid var(--ak-line);border-radius:18px;background:var(--ak-card);padding:20px 24px;margin-bottom:14px;animation:akfade .4s ease both; }
+.prof-avatar { width:84px;height:84px;border-radius:50%;object-fit:cover;background:linear-gradient(135deg,#4f6df5,#8e6cf4);color:#fff;font-size:34px;font-weight:800;display:flex;align-items:center;justify-content:center;flex:none; }
+.prof-card b { display:block;font-size:19px;color:var(--ak-text); } .prof-card small { color:var(--ak-muted); }
+/* ===== Animations d'accueil ===== */
+@keyframes akfade { from { opacity:0;transform:translateY(14px); } to { opacity:1;transform:none; } }
+@keyframes akgrow { from { width:0; } }
+@keyframes akfloat { 0%,100% { transform:translateY(0) rotate(0); } 50% { transform:translateY(-8px) rotate(4deg); } }
+@keyframes akglow { 0%,100% { box-shadow:0 0 0 0 rgba(79,109,245,.35); } 50% { box-shadow:0 0 0 10px rgba(79,109,245,0); } }
+.hero { animation:akfade .5s ease both; }
+.hero-orb { animation:akfloat 4s ease-in-out infinite; }
+.mini-stat { animation:akfade .5s ease both;transition:transform .2s ease,box-shadow .2s ease; }
+.stat-row .mini-stat:nth-child(2) { animation-delay:.07s; } .stat-row .mini-stat:nth-child(3) { animation-delay:.14s; } .stat-row .mini-stat:nth-child(4) { animation-delay:.21s; }
+.mini-stat:hover { transform:translateY(-3px);box-shadow:0 10px 24px rgba(42,55,90,.1); }
+.mini-stat small { display:block;font-size:11.5px;color:var(--ak-muted);margin-top:3px;line-height:1.35; }
+.guide-grid { grid-template-columns:repeat(auto-fit,minmax(250px,1fr))!important; }
+.guide-card { display:flex;gap:14px;align-items:flex-start;text-align:left;width:100%;padding:16px;border-radius:16px;border:1px solid var(--ak-line)!important;
+  background:var(--ak-card)!important;cursor:pointer;animation:akfade .5s ease both;animation-delay:calc(var(--i) * 70ms);
+  transition:transform .2s ease,box-shadow .2s ease,border-color .2s ease; }
+.guide-card:hover { transform:translateY(-4px);box-shadow:0 14px 30px rgba(79,109,245,.16);border-color:var(--ak-blue)!important; }
+.gc-ico { flex:none;width:42px;height:42px;border-radius:13px;background:linear-gradient(135deg,#4f6df5,#8e6cf4);color:#fff!important;display:flex;align-items:center;justify-content:center;font-size:18px; }
+.gc-ico .ak-ico { margin:0;width:21px;height:21px; }
+.gc-body { display:flex;flex-direction:column;gap:4px; }
+.gc-body > span { font-weight:400!important; }
+.global-metrics { grid-template-columns:repeat(auto-fit,minmax(190px,1fr))!important; }
+.gc-body b { font-size:15px;color:var(--ak-text)!important; } .gc-body > span { font-size:12.8px;line-height:1.45;color:var(--ak-muted)!important; }
+.gc-body em { font-style:normal;font-size:12.5px;font-weight:700;color:var(--ak-blue)!important;margin-top:4px; }
+.act-list { display:grid;gap:12px;margin:16px 0; }
+.act-row { border:1px solid var(--ak-line);border-radius:16px;background:var(--ak-card);padding:14px 16px;animation:akfade .45s ease both; }
+.act-row:nth-child(2) { animation-delay:.08s; } .act-row:nth-child(3) { animation-delay:.16s; }
+.act-head { display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;color:var(--ak-text); }
+.act-name { font-weight:700;display:inline-flex;align-items:center; } .act-head b { font-size:18px; }
+.act-bar { height:9px;border-radius:99px;background:var(--ak-soft);overflow:hidden; }
+.act-bar i { display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,#4f6df5,#8e6cf4);animation:akgrow .9s ease both; }
+.act-off .act-head b, .act-off .act-name { color:var(--ak-muted); }
+.act-foot { display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:9px;flex-wrap:wrap; }
+.act-foot small { color:var(--ak-muted);font-size:12.5px; }
+.info-chips { display:flex;gap:10px;flex-wrap:wrap;margin:6px 0 14px; }
+.info-chips span { background:var(--ak-soft);color:var(--ak-text);border-radius:999px;padding:6px 14px;font-size:12.8px; }
+.next-step { display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap;border-radius:16px;padding:14px 18px;margin-bottom:16px;
+  background:linear-gradient(120deg,rgba(79,109,245,.1),rgba(142,108,244,.12));border:1px solid var(--ak-line);animation:akfade .5s ease both .2s; }
+.next-step p { margin:4px 0 0;color:var(--ak-text);font-weight:600; }
+.next-step .ak-act { animation:akglow 2s ease-in-out infinite; }
+.progress-src { display:block;color:var(--ak-muted);font-size:11.5px;margin:-2px 0 8px; }
+.gc-detail { display:block;color:var(--ak-muted);margin-top:2px; }
+.global-course-bar div { animation:akgrow .9s ease both; }
+.global-metrics small { display:block;font-size:11px;color:var(--ak-muted);margin-top:3px; }
 /* ===== Colle orale ===== */
 .oral-card { border:1px solid var(--ak-line);border-radius:18px;background:var(--ak-card);padding:22px 26px; }
 .oral-tag { display:inline-block;font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:var(--ak-blue)!important;margin-bottom:8px; }
@@ -4011,8 +4146,8 @@ LANG_APPLY_JS = r"""
 """
 
 I18N_SRC = r"""
-  const I18N = [["NAVIGATION", "NAVIGATION"], ["Accueil", "Home"], ["Mes dossiers", "My folders"], ["Réviser", "Revise"], ["Flashcards", "Flashcards"], ["Quiz / QCM", "Quiz / MCQ"], ["Résumé", "Summary"], ["Assistant IA", "AI Assistant"], ["Progression", "Progress"], ["À revoir", "To review"], ["Historique", "History"], ["Paramètres", "Settings"], ["Administration", "Administration"], ["Déconnexion", "Log out"], ["Administrateur", "Administrator"], ["Utilisateur", "User"], ["AKORI · Espace de révision", "AKORI · Revision space"], ["Cours actif", "Active course"], ["Bonjour 👋", "Hello 👋"], ["Prêt à booster votre révision ?", "Ready to boost your revision?"], ["AKORI transforme vos cours PDF en un espace de révision intelligent : résumé, flashcards roulette, quiz et assistant RAG.", "AKORI turns your PDF courses into a smart revision space: summary, roulette flashcards, quiz and RAG assistant."], ["💡 Guide de révision AKORI & mode roulette flashcards", "💡 AKORI revision guide & flashcards roulette mode"], ["1. Chargez vos dossiers", "1. Load your folders"], ["Glissez vos PDF dans Mes dossiers pour activer l'indexation FAISS.", "Drop your PDFs in My folders to enable FAISS indexing."], ["2. Lancement roulette", "2. Start the roulette"], ["Générez au moins 7 flashcards. Les questions défilent automatiquement en boucle.", "Generate at least 7 flashcards. Questions scroll automatically in a loop."], ["3. Clic & réponse effacée", "3. Click & answer hidden"], ["Cliquez sur la carte pour stopper/relancer. La réponse s'efface à chaque relance.", "Click the card to stop/restart. The answer is hidden at each restart."], ["Cours importés", "Imported courses"], ["Fragments indexés", "Indexed fragments"], ["Échanges du cours", "Course exchanges"], ["Recherche active", "Search active"], ["Réviser un cours en un clic", "Revise a course in one click"], ["Générez les outils principaux à partir du cours actif.", "Generate the main tools from the active course."], ["Résumé · Flashcards · Quiz / QCM · Assistant IA", "Summary · Flashcards · Quiz / MCQ · AI Assistant"], ["Mes cours", "My courses"], ["Vos supports de révision indexés localement.", "Your revision materials indexed locally."], ["Aucun cours sélectionné", "No course selected"], ["Commencer la révision →", "Start revising →"], ["Tous vos supports PDF sont centralisés ici. Dès qu'un document est sélectionné, AKORI extrait son contenu et construit automatiquement son index.", "All your PDF materials are gathered here. As soon as a document is selected, AKORI extracts its content and builds its index automatically."], ["＋\nAjouter un document", "＋\nAdd a document"], ["Sélectionnez un PDF : extraction et indexation automatiques.", "Select a PDF: automatic extraction and indexing."], ["Indexé", "Indexed"], ["Sélectionnez un cours pour afficher son espace de révision.", "Select a course to display its revision space."], ["Date inconnue", "Unknown date"], ["Général", "General"], ["📁 Aucun document pour le moment.", "📁 No document yet."], ["Ajoutez votre premier PDF pour commencer.", "Add your first PDF to get started."], ["📚 Aucun cours pour le moment.", "📚 No course yet."], ["Importez votre premier PDF dans 'Mes dossiers' pour commencer.", "Import your first PDF in 'My folders' to get started."], ["Aucun document chargé.", "No document loaded."], ["Réviser ce cours", "Revise this course"], ["Une vue centrale pour accéder rapidement au résumé, aux flashcards, au quiz et à l'assistant.", "A central view to quickly reach the summary, flashcards, quiz and assistant."], ["Flashcards — Mode Roulette", "Flashcards — Roulette mode"], ["✦ Générer les flashcards", "✦ Generate flashcards"], ["🔄 Régénérer (7 minimum)", "🔄 Regenerate (7 minimum)"], ["Afficher la réponse", "Show the answer"], ["✓ Je savais", "✓ I knew it"], ["↻ À revoir", "↻ To review"], ["Aucune flashcard générée.", "No flashcards generated."], ["Choisissez un cours puis cliquez sur « Générer les flashcards ».", "Choose a course then click “Generate flashcards”."], ["SESSION TERMINÉE", "SESSION COMPLETED"], ["Maîtrise", "Mastery"], ["Maîtrisées", "Mastered"], ["Cliquez sur « 🔄 Régénérer (7 minimum) » pour obtenir une nouvelle série.", "Click “🔄 Regenerate (7 minimum)” to get a new set."], ["Quiz d'évaluation", "Evaluation quiz"], ["Cliquez sur une réponse, validez, puis passez à la question suivante.", "Click an answer, validate, then go to the next question."], ["✦ Générer le quiz", "✦ Generate the quiz"], ["🔁 Rejouer", "🔁 Replay"], ["Valider la réponse", "Validate the answer"], ["Question suivante →", "Next question →"], ["Voir le résultat 🎯", "See the result 🎯"], ["Choisissez votre réponse", "Choose your answer"], ["Aucun quiz généré.", "No quiz generated."], ["Choisissez un cours puis cliquez sur « Générer le quiz ».", "Choose a course then click “Generate the quiz”."], ["QUIZ TERMINÉ", "QUIZ COMPLETED"], ["Votre résultat a été enregistré dans la progression de ce cours.", "Your result has been saved in this course's progress."], ["🏆 Sans faute, bravo !", "🏆 Perfect score, well done!"], ["✅ Bonne réponse !", "✅ Correct answer!"], ["❌ Réponse incorrecte", "❌ Incorrect answer"], ["Explication :", "Explanation:"], ["Résumé du cours", "Course summary"], ["Générer le résumé", "Generate the summary"], ["Sélectionnez un cours puis lancez la génération.", "Select a course then start the generation."], ["Assistant AKORI", "AKORI Assistant"], ["Posez une question sur le cours actif. Le moteur récupère d'abord les passages pertinents avec FAISS, puis Gemini génère la réponse à partir du contexte récupéré.", "Ask a question about the active course. The engine first retrieves the relevant passages with FAISS, then Gemini generates the answer from the retrieved context."], ["Envoyer", "Send"], ["Posez une question sur le cours…", "Ask a question about the course…"], ["Ma progression", "My progress"], ["Commencez par la vue globale, puis consultez le détail du cours sélectionné.", "Start with the global view, then check the details of the selected course."], ["Détail du cours sélectionné", "Selected course details"], ["Votre progression commencera ici.", "Your progress will start here."], ["Importez un cours pour créer votre premier suivi. Tant qu'aucun cours n'est chargé, la progression reste à 0 %.", "Import a course to create your first tracking. As long as no course is loaded, progress stays at 0%."], ["Aucune progression à afficher.", "No progress to display."], ["Importez un cours puis utilisez les flashcards ou terminez un quiz pour commencer à construire votre progression.", "Import a course then use the flashcards or finish a quiz to start building your progress."], ["VUE D'ENSEMBLE", "OVERVIEW"], ["Progression globale", "Global progress"], ["Synthèse de tous vos cours réellement importés et de vos interactions de révision.", "Summary of all your imported courses and your revision interactions."], ["Cours suivis", "Tracked courses"], ["Cours commencés", "Started courses"], ["Flashcards maîtrisées", "Mastered flashcards"], ["Moyenne des quiz", "Quiz average"], ["Progression par cours", "Progress by course"], ["Le détail pédagogique reste lié au cours sélectionné : points forts, points faibles, flashcards et résultats des quiz.", "The detailed breakdown stays linked to the selected course: strengths, weaknesses, flashcards and quiz results."], ["Calculée uniquement à partir des interactions enregistrées sur ce cours.", "Computed only from the interactions recorded on this course."], ["Quiz terminés", "Completed quizzes"], ["✦ Points forts", "✦ Strengths"], ["↗ Points faibles", "↗ Weaknesses"], ["Pas encore assez de réponses de quiz pour identifier un point fort.", "Not enough quiz answers yet to identify a strength."], ["Pas encore assez de réponses de quiz pour identifier un point faible.", "Not enough quiz answers yet to identify a weakness."], ["Aucun point fort clairement établi pour le moment.", "No clear strength established yet."], ["Aucun point faible clairement établi pour le moment.", "No clear weakness established yet."], ["Cette section regroupera les flashcards marquées « À revoir » et les erreurs de quiz.", "This section will gather the flashcards marked “To review” and the quiz mistakes."], ["📌 Votre file « À revoir » apparaîtra ici après les interactions.", "📌 Your “To review” queue will appear here after some interactions."], ["Historique du cours actif", "Active course history"], ["Aucun historique pour le moment.", "No history yet."], ["Aucune conversation enregistrée.", "No conversation recorded."], ["Vous", "You"], ["Personnalisez AKORI. Vos choix sont mémorisés dans ce navigateur.", "Customize AKORI. Your choices are saved in this browser."], ["Mode sombre", "Dark mode"], ["Basculez entre le thème clair et le thème sombre d'un seul clic.", "Switch between the light and dark theme with one click."], ["Langue", "Language"], ["Langue de l'interface et des réponses générées par l'IA.", "Language of the interface and of the generated summaries, flashcards and quizzes. In the chat, AKORI answers in the language you write in."], ["Connexion", "Sign in"], ["Créer un compte", "Create an account"], ["Nom d'utilisateur", "Username"], ["Mot de passe", "Password"], ["Confirmer le mot de passe", "Confirm the password"], ["Rester connecté", "Stay signed in"], ["Se connecter", "Sign in"], ["Créer mon compte", "Create my account"], ["Bienvenue sur AKORI", "Welcome to AKORI"], ["Connectez-vous pour retrouver vos cours, flashcards, quiz et historiques archivés.", "Sign in to find your archived courses, flashcards, quizzes and history."], ["Vos données sont enregistrées dans votre compte et restent disponibles à chaque connexion.", "Your data is saved in your account and available every time you sign in."], ["⚠️ Nom d'utilisateur invalide (3 à 32 caractères : lettres, chiffres, . _ -).", "⚠️ Invalid username (3 to 32 characters: letters, digits, . _ -)."], ["⚠️ Mot de passe trop court (6 caractères minimum).", "⚠️ Password too short (6 characters minimum)."], ["⚠️ Ce nom d'utilisateur existe déjà.", "⚠️ This username already exists."], ["✅ Compte créé.", "✅ Account created."], ["⚠️ Identifiants incorrects.", "⚠️ Incorrect username or password."], ["⛔ Ce compte est désactivé. Contactez l'administrateur.", "⛔ This account is disabled. Contact the administrator."], ["⏳ Trop de tentatives. Réessayez dans une minute.", "⏳ Too many attempts. Try again in a minute."], ["⚠️ Les mots de passe ne correspondent pas.", "⚠️ The passwords do not match."], ["✅ Vous êtes déconnecté.", "✅ You are signed out."], ["Connexion requise.", "Sign-in required."], ["⏳ Analyse du PDF… extraction, découpage et indexation en cours.", "⏳ Analyzing the PDF… extraction, splitting and indexing in progress."], ["⏳ Extraction du texte…", "⏳ Extracting the text…"], ["⏳ Enregistrement…", "⏳ Saving…"], ["⚠️ Aucun fichier sélectionné.", "⚠️ No file selected."], ["⚠️ Aucun texte exploitable dans ce PDF (document scanné ?).", "⚠️ No usable text in this PDF (scanned document?)."], ["⚠️ Veuillez d'abord sélectionner un cours.", "⚠️ Please select a course first."], ["⏳ Génération…", "⏳ Generating…"], ["⚠️ Le titre du document est indisponible.", "⚠️ The document title is unavailable."], ["⚠️ Aucune information pertinente n'a pu être extraite du document.", "⚠️ No relevant information could be extracted from the document."], ["Gemini est très sollicité en ce moment. Réessayez dans une dizaine de secondes.", "Gemini is very busy right now. Try again in about ten seconds."], ["Quota ou limite temporaire Gemini atteinte. Attendez un peu avant de relancer la génération.", "Gemini quota or temporary limit reached. Wait a little before generating again."], ["⚠️ Gemini est temporairement indisponible. Réessayez dans quelques secondes.", "⚠️ Gemini is temporarily unavailable. Try again in a few seconds."], ["⚠️ La limite temporaire de Gemini a été atteinte. Attendez un peu puis réessayez.", "⚠️ Gemini's temporary limit was reached. Wait a little then try again."], ["⚠️ Impossible de générer les flashcards à partir du contexte.", "⚠️ Unable to generate flashcards from the context."], ["⚠️ Impossible de générer le quiz.", "⚠️ Unable to generate the quiz."], ["⚠️ Sélectionnez d'abord un cours.", "⚠️ Select a course first."], ["⚠️ Aucun document sélectionné.", "⚠️ No document selected."], ["❌ Document vide.", "❌ Empty document."], ["❌ Le modèle n'a renvoyé aucune flashcard valide.", "❌ The model returned no valid flashcard."], ["⏳ Génération des flashcards…", "⏳ Generating flashcards…"], ["⏳ Génération du quiz…", "⏳ Generating the quiz…"], ["⏳ Génération du résumé…", "⏳ Generating the summary…"], ["🔁 Quiz relancé.", "🔁 Quiz restarted."], ["⚠️ Générez d'abord un quiz.", "⚠️ Generate a quiz first."], ["ℹ️ Réponse déjà validée : passez à la suite.", "ℹ️ Answer already validated: move on."], ["⚠️ Sélectionnez une réponse avant de valider.", "⚠️ Select an answer before validating."], ["✅ Bonne réponse.", "✅ Correct answer."], ["❌ Réponse incorrecte. Consultez l'explication.", "❌ Incorrect answer. Check the explanation."], ["⚠️ Validez d'abord cette réponse.", "⚠️ Validate this answer first."], ["Console d'administration", "Administration console"], ["Suivi, maintenance et gestion des comptes AKORI", "Monitoring, maintenance and account management for AKORI"], ["← Retour à l'application", "← Back to the app"], ["↻ Actualiser", "↻ Refresh"], ["Utilisateurs", "Users"], ["Activité", "Activity"], ["Maintenance", "Maintenance"], ["Nouveau mot de passe", "New password"], ["Activer / Désactiver", "Enable / Disable"], ["Réinitialiser le mot de passe", "Reset the password"], ["Promouvoir / Rétrograder", "Promote / Demote"], ["Supprimer le compte", "Delete the account"], ["Je confirme la suppression définitive du compte et de ses données", "I confirm the permanent deletion of the account and its data"], ["Sauvegarde complète (ZIP)", "Full backup (ZIP)"], ["Recharger les index", "Reload the indexes"], ["Purger les connexions expirées", "Purge expired sign-ins"], ["Alléger le journal", "Trim the log"], ["Sauvegarde", "Backup"], ["Comptes", "Accounts"], ["Actifs (24 h)", "Active (24 h)"], ["Stockage utilisé", "Storage used"], ["Requêtes IA", "AI requests"], ["Jetons estimés", "Estimated tokens"], ["Erreurs (24 h)", "Errors (24 h)"], ["Sessions en ligne", "Online sessions"], ["Modèle principal", "Main model"], ["Modèles de secours", "Fallback models"], ["Clé API Gemini", "Gemini API key"], ["Disponibilité", "Uptime"], ["Dossier de données", "Data folder"], ["Taille PDF maximale", "Maximum PDF size"], ["✅ configurée", "✅ configured"], ["⛔ Accès réservé à l'administrateur.", "⛔ Reserved for the administrator."], ["⚠️ Sélectionnez un utilisateur.", "⚠️ Select a user."], ["⚠️ Vous ne pouvez pas désactiver votre propre compte.", "⚠️ You cannot disable your own account."], ["⚠️ Vous ne pouvez pas supprimer votre propre compte.", "⚠️ You cannot delete your own account."], ["⚠️ Il doit rester au moins un administrateur.", "⚠️ At least one administrator must remain."], ["⚠️ Cochez la confirmation pour supprimer définitivement ce compte et ses données.", "⚠️ Tick the confirmation to permanently delete this account and its data."], ["Rôle", "Role"], ["Statut", "Status"], ["Créé le", "Created on"], ["Dernière connexion", "Last sign-in"], ["Connexions", "Sign-ins"], ["Cours", "Courses"], ["Échanges", "Exchanges"], ["Quiz", "Quizzes"], ["Stockage", "Storage"], ["Actif", "Active"], ["Désactivé", "Disabled"], ["Date", "Date"], ["Événement", "Event"], ["Détail", "Detail"], ["⚠️ Session expirée : rechargez la page pour vous reconnecter.", "⚠️ Session expired: reload the page to sign in again."], ["Gemini met trop de temps à répondre. Réessayez dans un instant.", "Gemini is taking too long to answer. Try again in a moment."], ["Content de te revoir", "Good to see you again"], ["Connecte-toi pour accéder à tes cours", "Sign in to access your courses"], ["Email", "Email"], ["Mot de passe oublié ?", "Forgot your password?"], ["Pas encore de compte ?", "No account yet?"], ["Crée ton compte", "Create your account"], ["Gratuit, sans carte bancaire", "Free, no credit card"], ["Déjà un compte ?", "Already have an account?"], ["ton@email.com", "you@email.com"], ["8 caractères minimum", "8 characters minimum"], ["Comment tu t'appelles ?", "What's your name?"], ["Et quel est ton niveau scolaire ?", "And what's your school level?"], ["Prénom", "First name"], ["Ton prénom", "Your first name"], ["Niveau", "Level"], ["Objectif", "Goal"], ["🏫 Collège\nDe la 6ème à la 3ème", "🏫 Middle school\nGrades 6 to 9"], ["🎓 Lycée\nSeconde, Première, Terminale", "🎓 High school\nYears 10 to 12"], ["🎯 Études supérieures\nUniversité, Prépa, BTS...", "🎯 Higher education\nUniversity, prep school, vocational..."], ["📚 Réviser mes cours\nRelire, comprendre et mémoriser régulièrement", "📚 Revise my courses\nReread, understand and memorize regularly"], ["📝 Préparer un examen\nFlashcards et quiz avant le jour J", "📝 Prepare for an exam\nFlashcards and quizzes before the big day"], ["🧠 Mieux comprendre un chapitre\nPoser mes questions directement au cours", "🧠 Understand a chapter better\nAsk my questions directly to the course"], ["Continuer", "Continue"], ["Retour", "Back"], ["Accéder à AKORI", "Open AKORI"], ["Que veux-tu faire avec AKORI ?", "What do you want to do with AKORI?"], ["Choisis ton objectif principal", "Choose your main goal"], ["Dans quelle langue veux-tu travailler ?", "Which language do you want to work in?"], ["Tu pourras la changer à tout moment dans les paramètres", "You can change it at any time in the settings"], ["Ton espace est prêt. Importe ton premier cours en PDF et laisse AKORI générer tes flashcards, quiz et résumés.", "Your space is ready. Import your first course as a PDF and let AKORI generate your flashcards, quizzes and summaries."], ["⚠️ Adresse e-mail invalide.", "⚠️ Invalid email address."], ["⚠️ Un compte existe déjà avec cet e-mail.", "⚠️ An account already exists with this email."], ["⚠️ Entre ton prénom et choisis ton niveau.", "⚠️ Enter your first name and choose your level."], ["⚠️ Choisis ton objectif principal.", "⚠️ Choose your main goal."], ["⚠️ Ton prénom est trop long (40 caractères maximum).", "⚠️ Your first name is too long (40 characters maximum)."], ["ℹ️ Pour réinitialiser ton mot de passe, contacte l'administrateur d'AKORI.", "ℹ️ To reset your password, contact the AKORI administrator."], ["Stockage", "Storage"], ["✅ Google Drive", "✅ Google Drive"], ["⚠️ Temporaire (non sauvegardé)", "⚠️ Temporary (not backed up)"], ["⏳ Mise à jour de l'index du cours (une seule fois)…", "⏳ Updating the course index (one time only)…"], ["OCR (PDF scannés)", "OCR (scanned PDFs)"], ["désactivé", "disabled"], ["⚠️ Aucun texte n'a pu être lu dans ce PDF scanné (OCR sans résultat).", "⚠️ No text could be read in this scanned PDF (OCR returned nothing)."], ["Tester Gemini", "Test Gemini"], ["Colle orale", "Oral exam"], ["AKORI vous interroge sur votre cours, comme à l'oral. Répondez à l'écrit ou à la voix : la correction se base uniquement sur le contenu du cours et vous indique la page à relire.", "AKORI quizzes you on your course, like an oral exam. Answer in writing or by voice: the grading relies only on the course content and tells you which page to reread."], ["Prêt pour votre colle ?", "Ready for your oral?"], ["Cliquez sur « Nouvelle question » : AKORI vous interroge sur votre cours, comme à l'oral.", "Click “New question”: AKORI quizzes you on your course, like an oral exam."], ["Nouvelle question", "New question"], ["Dicter ma réponse", "Dictate my answer"], ["Votre réponse", "Your answer"], ["Écrivez votre réponse ici, ou cliquez sur « Dicter ma réponse »…", "Write your answer here, or click “Dictate my answer”…"], ["Corriger ma réponse", "Grade my answer"], ["Question orale", "Oral question"], ["Très bien", "Very good"], ["Correct, à compléter", "Correct, needs completing"], ["À reprendre", "To redo"], ["Points maîtrisés", "Mastered points"], ["À retravailler", "To work on"], ["Aucun point clé repéré.", "No key point found."], ["Rien d'oublié, bravo.", "Nothing forgotten, well done."], ["À relire", "To reread"], ["Réponse modèle", "Model answer"], ["Mes dernières colles", "My latest orals"], ["Répondez à l'écrit ou à la voix, puis cliquez sur « Corriger ma réponse ».", "Answer in writing or by voice, then click “Grade my answer”."], ["⚠️ Cliquez d'abord sur « Nouvelle question ».", "⚠️ Click “New question” first."], ["⚠️ Écrivez ou dictez une réponse avant de la faire corriger.", "⚠️ Write or dictate an answer before grading it."], ["Correction approximative (IA indisponible).", "Approximate grading (AI unavailable)."], ["Liste des utilisateurs", "User list"], ["Rechercher un utilisateur", "Search a user"], ["N°", "No."], ["Profil", "Profile"], ["E-mail", "Email"], ["Mot de passe", "Password"], ["Chiffré", "Encrypted"], ["Modifier", "Edit"], ["Supprimer", "Delete"], ["Générer un mot de passe temporaire", "Generate a temporary password"], ["Sélectionnez un utilisateur dans la liste ou cliquez sur « Modifier ».", "Select a user in the list or click “Edit”."], ["Mot de passe chiffré : personne ne peut le lire. Définissez-en un nouveau ou générez un mot de passe temporaire.", "Encrypted password: nobody can read it. Set a new one or generate a temporary password."], ["Créé le", "Created on"], ["Afficher le mot de passe", "Show password"], ["Épingler comme chapitre", "Pin as chapter"], ["Lire à voix haute", "Read aloud"], ["Arrêter la lecture", "Stop reading"], ["Épinglé ✓", "Pinned ✓"], ["Lecture vocale indisponible", "Voice reading unavailable"], ["Extrait", "Excerpt"], ["Chapitres", "Chapters"], ["Chapitres épinglés", "Pinned chapters"], ["Les réponses de l'assistant que vous épinglez depuis le chat sont rangées ici, cours par cours. Relisez-les, ou écoutez-les, avant l'examen.", "The assistant answers you pin from the chat are kept here, course by course. Reread them, or listen to them, before the exam."], ["Aucun chapitre épinglé pour ce cours.", "No pinned chapter for this course."], ["Dans l'assistant, cliquez sur « Épingler comme chapitre » sous une réponse utile.", "In the assistant, click “Pin as chapter” under a useful answer."], ["Retirer", "Remove"], ["📌 Chapitre épinglé", "📌 Chapter pinned"], ["Retrouvez-le dans À revoir.", "Find it in To review."], ["Recherche (médiane)", "Search (median)"], ["1er mot (médiane)", "First word (median)"], ["Réponse complète (médiane)", "Full answer (median)"], ["Réponse complète (95e centile)", "Full answer (95th percentile)"], ["Questions hors cours refusées", "Off-topic questions declined"], ["Modèle d'embeddings", "Embedding model"], ["Seuil de pertinence", "Relevance threshold"], ["Mesures sur", "Measured over"]];
-  const PATTERNS = [["^⏳ Préparation de la question… \\((\\d+) s\\)$", "⏳ Preparing the question… ($1 s)"], ["^⏳ Correction en cours… \\((\\d+) s\\)$", "⏳ Grading in progress… ($1 s)"], ["^✅ Note : (\\d+)\\/10$", "✅ Score: $1/10"], ["^(\\d+) séance\\(s\\) · moyenne (.+)\\/10$", "$1 session(s) · average $2/10"], ["^Source : (.*)$", "Source: $1"], ["^(\\d+) cours · (\\d+) échanges · (.+)$", "$1 courses · $2 exchanges · $3"], ["^(\\d+) connexions$", "$1 sign-ins"], ["^✅ Mot de passe temporaire de « (.+) » : (.+) — à lui communiquer \\(affiché une seule fois\\)\\.$", "✅ Temporary password of “$1”: $2 — give it to the user (shown only once)."], ["^ℹ️ Pour supprimer « (.+) » : cochez la confirmation, puis cliquez sur « Supprimer le compte »\\.$", "ℹ️ To delete “$1”: tick the confirmation, then click “Delete the account”."], ["^ℹ️ Modification de « (.+) » : choisissez une action ci-dessous\\.$", "ℹ️ Editing “$1”: choose an action below."], ["^Clé API Gemini invalide : elle contient des caractères non autorisés \\(accents, symboles\\)\\. Collez la clé exacte, qui commence par AIza, dans le secret GEMINI_API_KEY\\.$", "Invalid Gemini API key: it contains forbidden characters (accents, symbols). Paste the exact key, starting with AIza, into the GEMINI_API_KEY secret."], ["^Gemini est très sollicité en ce moment\\. Réessayez dans une dizaine de secondes\\.(.*)$", "Gemini is very busy right now. Try again in about ten seconds.$1"], ["^Quota Gemini atteint : la limite de requêtes de votre clé est épuisée \\(par minute ou par jour\\)\\. Attendez une minute ou utilisez une autre clé\\.(.*)$", "Gemini quota reached: your key's request limit is used up (per minute or per day). Wait a minute or use another key.$1"], ["^Aucun modèle Gemini n'est accessible avec cette clé \\(404\\)\\. Vérifiez GEMINI_API_KEY et les noms de modèles\\.(.*)$", "No Gemini model is available with this key (404). Check GEMINI_API_KEY and the model names.$1"], ["^Connexion à Gemini impossible \\(réseau ou délai dépassé\\)\\. Réessayez dans un instant\\.(.*)$", "Cannot reach Gemini (network or timeout). Try again in a moment.$1"], ["^⏳ Lecture OCR des pages scannées (\\d+)\\/(\\d+)…$", "⏳ Reading scanned pages with OCR $1/$2…"], ["^✅ '(.+)' indexé avec succès \\((\\d+) fragments, OCR sur (\\d+) pages\\)\\.$", "✅ '$1' indexed successfully ($2 fragments, OCR on $3 pages)."], ["^Chapitre (\\d+)$", "Chapter $1"], ["^(\\d+) réponse\\(s\\)$", "$1 answer(s)"], ["^✅ '(.+)' indexé avec succès \\((\\d+) fragments\\)\\.$", "✅ '$1' indexed successfully ($2 fragments)."], ["^✅ '(.+)' est déjà indexé : réutilisé instantanément\\.$", "✅ '$1' is already indexed: reused instantly."], ["^❌ Erreur lors de l'indexation : (.*)$", "❌ Indexing error: $1"], ["^⏳ Indexation (\\d+)\\/(\\d+)…$", "⏳ Indexing $1/$2…"], ["^⚠️ Fichier trop volumineux \\(maximum (\\d+) Mo\\)\\.$", "⚠️ File too large (maximum $1 MB)."], ["^✅ (\\d+) flashcards prêtes !$", "✅ $1 flashcards ready!"], ["^⚠️ Seulement (\\d+) flashcard\\(s\\) obtenue\\(s\\) : il en faut au moins (\\d+)\\. Relancez la génération\\.$", "⚠️ Only $1 flashcard(s) obtained: at least $2 are needed. Generate again."], ["^❌ Erreur : (.*)$", "❌ Error: $1"], ["^⚠️ Génération impossible : (.*)$", "⚠️ Generation failed: $1"], ["^✅ Quiz de (\\d+) questions généré\\.$", "✅ Quiz of $1 questions generated."], ["^🎯 Quiz terminé : (\\d+)\\/(\\d+)\\.$", "🎯 Quiz completed: $1/$2."], ["^Score : (\\d+)$", "Score: $1"], ["^(\\d+)% de bonnes réponses$", "$1% correct answers"], ["^Bonne réponse : (.*)$", "Correct answer: $1"], ["^Le titre du document est : (.*)$", "The title of the document is: $1"], ["^QUIZ \\/ QCM · (.*)$", "QUIZ / MCQ · $1"], ["^(\\d+) fragments indexés · Progression (\\d+)% · RAG local$", "$1 indexed fragments · Progress $2% · Local RAG"], ["^Progression réelle · (.*)$", "Real progress · $1"], ["^Ajouté le (.*)$", "Added on $1"], ["^Indexé · (\\d+) fragments$", "Indexed · $1 fragments"], ["^✅ Compte « (.+) » (activé|désactivé)\\.$", "✅ Account “$1” updated."], ["^✅ Mot de passe de « (.+) » réinitialisé.*$", "✅ Password of “$1” reset (their remembered sign-ins are revoked)."], ["^✅ « (.+) » est maintenant (administrateur|utilisateur)\\.$", "✅ “$1” role updated."], ["^✅ Compte « (.+) » et toutes ses données supprimés\\.$", "✅ Account “$1” and all its data deleted."], ["^✅ Sauvegarde créée \\((.+)\\)\\.$", "✅ Backup created ($1)."], ["^✅ (\\d+) connexion\\(s\\) mémorisée\\(s\\) expirée\\(s\\) purgée\\(s\\)\\.$", "✅ $1 expired remembered sign-in(s) purged."], ["^✅ Journal allégé : (\\d+) ligne\\(s\\) ancienne\\(s\\) supprimée\\(s\\)\\.$", "✅ Log trimmed: $1 old line(s) removed."], ["^✅ Index et cours rechargés.*$", "✅ Indexes and courses will be reloaded from disk on each user's next action."], ["^⏳ Génération des flashcards… \\((\\d+) s\\)$", "⏳ Generating flashcards… ($1 s)"], ["^⏳ Génération du quiz… \\((\\d+) s\\)$", "⏳ Generating the quiz… ($1 s)"], ["^⏳ Génération du résumé… \\((\\d+) s\\)$", "⏳ Generating the summary… ($1 s)"], ["^C'est parti (.+) !$", "Let's go $1!"], ["^Bonjour (.+) 👋$", "Hello $1 👋"], ["^⚠️ Mot de passe trop court \\((\\d+) caractères minimum\\)\\.$", "⚠️ Password too short ($1 characters minimum)."]].map(([re, to]) => [new RegExp(re), to]);
+  const I18N = [["NAVIGATION", "NAVIGATION"], ["Accueil", "Home"], ["Mes dossiers", "My folders"], ["Réviser", "Revise"], ["Flashcards", "Flashcards"], ["Quiz / QCM", "Quiz / MCQ"], ["Résumé", "Summary"], ["Assistant IA", "AI Assistant"], ["Progression", "Progress"], ["À revoir", "To review"], ["Historique", "History"], ["Paramètres", "Settings"], ["Administration", "Administration"], ["Déconnexion", "Log out"], ["Administrateur", "Administrator"], ["Utilisateur", "User"], ["AKORI · Espace de révision", "AKORI · Revision space"], ["Cours actif", "Active course"], ["Bonjour 👋", "Hello 👋"], ["Prêt à booster votre révision ?", "Ready to boost your revision?"], ["AKORI transforme vos cours PDF en un espace de révision intelligent : résumé, flashcards roulette, quiz et assistant RAG.", "AKORI turns your PDF courses into a smart revision space: summary, roulette flashcards, quiz and RAG assistant."], ["💡 Guide de révision AKORI & mode roulette flashcards", "💡 AKORI revision guide & flashcards roulette mode"], ["1. Chargez vos dossiers", "1. Load your folders"], ["Glissez vos PDF dans Mes dossiers pour activer l'indexation FAISS.", "Drop your PDFs in My folders to enable FAISS indexing."], ["2. Lancement roulette", "2. Start the roulette"], ["Générez au moins 7 flashcards. Les questions défilent automatiquement en boucle.", "Generate at least 7 flashcards. Questions scroll automatically in a loop."], ["3. Clic & réponse effacée", "3. Click & answer hidden"], ["Cliquez sur la carte pour stopper/relancer. La réponse s'efface à chaque relance.", "Click the card to stop/restart. The answer is hidden at each restart."], ["Cours importés", "Imported courses"], ["Fragments indexés", "Indexed fragments"], ["Échanges du cours", "Course exchanges"], ["Recherche active", "Search active"], ["Réviser un cours en un clic", "Revise a course in one click"], ["Générez les outils principaux à partir du cours actif.", "Generate the main tools from the active course."], ["Résumé · Flashcards · Quiz / QCM · Assistant IA", "Summary · Flashcards · Quiz / MCQ · AI Assistant"], ["Mes cours", "My courses"], ["Vos supports de révision indexés localement.", "Your revision materials indexed locally."], ["Aucun cours sélectionné", "No course selected"], ["Commencer la révision →", "Start revising →"], ["Tous vos supports PDF sont centralisés ici. Dès qu'un document est sélectionné, AKORI extrait son contenu et construit automatiquement son index.", "All your PDF materials are gathered here. As soon as a document is selected, AKORI extracts its content and builds its index automatically."], ["＋\nAjouter un document", "＋\nAdd a document"], ["Sélectionnez un PDF : extraction et indexation automatiques.", "Select a PDF: automatic extraction and indexing."], ["Indexé", "Indexed"], ["Sélectionnez un cours pour afficher son espace de révision.", "Select a course to display its revision space."], ["Date inconnue", "Unknown date"], ["Général", "General"], ["📁 Aucun document pour le moment.", "📁 No document yet."], ["Ajoutez votre premier PDF pour commencer.", "Add your first PDF to get started."], ["📚 Aucun cours pour le moment.", "📚 No course yet."], ["Importez votre premier PDF dans 'Mes dossiers' pour commencer.", "Import your first PDF in 'My folders' to get started."], ["Aucun document chargé.", "No document loaded."], ["Réviser ce cours", "Revise this course"], ["Une vue centrale pour accéder rapidement au résumé, aux flashcards, au quiz et à l'assistant.", "A central view to quickly reach the summary, flashcards, quiz and assistant."], ["Flashcards — Mode Roulette", "Flashcards — Roulette mode"], ["✦ Générer les flashcards", "✦ Generate flashcards"], ["🔄 Régénérer (7 minimum)", "🔄 Regenerate (7 minimum)"], ["Afficher la réponse", "Show the answer"], ["✓ Je savais", "✓ I knew it"], ["↻ À revoir", "↻ To review"], ["Aucune flashcard générée.", "No flashcards generated."], ["Choisissez un cours puis cliquez sur « Générer les flashcards ».", "Choose a course then click “Generate flashcards”."], ["SESSION TERMINÉE", "SESSION COMPLETED"], ["Maîtrise", "Mastery"], ["Maîtrisées", "Mastered"], ["Cliquez sur « 🔄 Régénérer (7 minimum) » pour obtenir une nouvelle série.", "Click “🔄 Regenerate (7 minimum)” to get a new set."], ["Quiz d'évaluation", "Evaluation quiz"], ["Cliquez sur une réponse, validez, puis passez à la question suivante.", "Click an answer, validate, then go to the next question."], ["✦ Générer le quiz", "✦ Generate the quiz"], ["🔁 Rejouer", "🔁 Replay"], ["Valider la réponse", "Validate the answer"], ["Question suivante →", "Next question →"], ["Voir le résultat 🎯", "See the result 🎯"], ["Choisissez votre réponse", "Choose your answer"], ["Aucun quiz généré.", "No quiz generated."], ["Choisissez un cours puis cliquez sur « Générer le quiz ».", "Choose a course then click “Generate the quiz”."], ["QUIZ TERMINÉ", "QUIZ COMPLETED"], ["Votre résultat a été enregistré dans la progression de ce cours.", "Your result has been saved in this course's progress."], ["🏆 Sans faute, bravo !", "🏆 Perfect score, well done!"], ["✅ Bonne réponse !", "✅ Correct answer!"], ["❌ Réponse incorrecte", "❌ Incorrect answer"], ["Explication :", "Explanation:"], ["Résumé du cours", "Course summary"], ["Générer le résumé", "Generate the summary"], ["Sélectionnez un cours puis lancez la génération.", "Select a course then start the generation."], ["Assistant AKORI", "AKORI Assistant"], ["Posez une question sur le cours actif. Le moteur récupère d'abord les passages pertinents avec FAISS, puis Gemini génère la réponse à partir du contexte récupéré.", "Ask a question about the active course. The engine first retrieves the relevant passages with FAISS, then Gemini generates the answer from the retrieved context."], ["Envoyer", "Send"], ["Posez une question sur le cours…", "Ask a question about the course…"], ["Ma progression", "My progress"], ["Commencez par la vue globale, puis consultez le détail du cours sélectionné.", "Start with the global view, then check the details of the selected course."], ["Détail du cours sélectionné", "Selected course details"], ["Votre progression commencera ici.", "Your progress will start here."], ["Importez un cours pour créer votre premier suivi. Tant qu'aucun cours n'est chargé, la progression reste à 0 %.", "Import a course to create your first tracking. As long as no course is loaded, progress stays at 0%."], ["Aucune progression à afficher.", "No progress to display."], ["Importez un cours puis utilisez les flashcards ou terminez un quiz pour commencer à construire votre progression.", "Import a course then use the flashcards or finish a quiz to start building your progress."], ["VUE D'ENSEMBLE", "OVERVIEW"], ["Progression globale", "Global progress"], ["Synthèse de tous vos cours réellement importés et de vos interactions de révision.", "Summary of all your imported courses and your revision interactions."], ["Cours suivis", "Tracked courses"], ["Cours commencés", "Started courses"], ["Flashcards maîtrisées", "Mastered flashcards"], ["Moyenne des quiz", "Quiz average"], ["Progression par cours", "Progress by course"], ["Le détail pédagogique reste lié au cours sélectionné : points forts, points faibles, flashcards et résultats des quiz.", "The detailed breakdown stays linked to the selected course: strengths, weaknesses, flashcards and quiz results."], ["Calculée uniquement à partir des interactions enregistrées sur ce cours.", "Computed only from the interactions recorded on this course."], ["Quiz terminés", "Completed quizzes"], ["✦ Points forts", "✦ Strengths"], ["↗ Points faibles", "↗ Weaknesses"], ["Pas encore assez de réponses de quiz pour identifier un point fort.", "Not enough quiz answers yet to identify a strength."], ["Pas encore assez de réponses de quiz pour identifier un point faible.", "Not enough quiz answers yet to identify a weakness."], ["Aucun point fort clairement établi pour le moment.", "No clear strength established yet."], ["Aucun point faible clairement établi pour le moment.", "No clear weakness established yet."], ["Cette section regroupera les flashcards marquées « À revoir » et les erreurs de quiz.", "This section will gather the flashcards marked “To review” and the quiz mistakes."], ["📌 Votre file « À revoir » apparaîtra ici après les interactions.", "📌 Your “To review” queue will appear here after some interactions."], ["Historique du cours actif", "Active course history"], ["Aucun historique pour le moment.", "No history yet."], ["Aucune conversation enregistrée.", "No conversation recorded."], ["Vous", "You"], ["Personnalisez AKORI. Vos choix sont mémorisés dans ce navigateur.", "Customize AKORI. Your choices are saved in this browser."], ["Mode sombre", "Dark mode"], ["Basculez entre le thème clair et le thème sombre d'un seul clic.", "Switch between the light and dark theme with one click."], ["Langue", "Language"], ["Langue de l'interface et des réponses générées par l'IA.", "Language of the interface and of the generated summaries, flashcards and quizzes. In the chat, AKORI answers in the language you write in."], ["Connexion", "Sign in"], ["Créer un compte", "Create an account"], ["Nom d'utilisateur", "Username"], ["Mot de passe", "Password"], ["Confirmer le mot de passe", "Confirm the password"], ["Rester connecté", "Stay signed in"], ["Se connecter", "Sign in"], ["Créer mon compte", "Create my account"], ["Bienvenue sur AKORI", "Welcome to AKORI"], ["Connectez-vous pour retrouver vos cours, flashcards, quiz et historiques archivés.", "Sign in to find your archived courses, flashcards, quizzes and history."], ["Vos données sont enregistrées dans votre compte et restent disponibles à chaque connexion.", "Your data is saved in your account and available every time you sign in."], ["⚠️ Nom d'utilisateur invalide (3 à 32 caractères : lettres, chiffres, . _ -).", "⚠️ Invalid username (3 to 32 characters: letters, digits, . _ -)."], ["⚠️ Mot de passe trop court (6 caractères minimum).", "⚠️ Password too short (6 characters minimum)."], ["⚠️ Ce nom d'utilisateur existe déjà.", "⚠️ This username already exists."], ["✅ Compte créé.", "✅ Account created."], ["⚠️ Identifiants incorrects.", "⚠️ Incorrect username or password."], ["⛔ Ce compte est désactivé. Contactez l'administrateur.", "⛔ This account is disabled. Contact the administrator."], ["⏳ Trop de tentatives. Réessayez dans une minute.", "⏳ Too many attempts. Try again in a minute."], ["⚠️ Les mots de passe ne correspondent pas.", "⚠️ The passwords do not match."], ["✅ Vous êtes déconnecté.", "✅ You are signed out."], ["Connexion requise.", "Sign-in required."], ["⏳ Analyse du PDF… extraction, découpage et indexation en cours.", "⏳ Analyzing the PDF… extraction, splitting and indexing in progress."], ["⏳ Extraction du texte…", "⏳ Extracting the text…"], ["⏳ Enregistrement…", "⏳ Saving…"], ["⚠️ Aucun fichier sélectionné.", "⚠️ No file selected."], ["⚠️ Aucun texte exploitable dans ce PDF (document scanné ?).", "⚠️ No usable text in this PDF (scanned document?)."], ["⚠️ Veuillez d'abord sélectionner un cours.", "⚠️ Please select a course first."], ["⏳ Génération…", "⏳ Generating…"], ["⚠️ Le titre du document est indisponible.", "⚠️ The document title is unavailable."], ["⚠️ Aucune information pertinente n'a pu être extraite du document.", "⚠️ No relevant information could be extracted from the document."], ["Gemini est très sollicité en ce moment. Réessayez dans une dizaine de secondes.", "Gemini is very busy right now. Try again in about ten seconds."], ["Quota ou limite temporaire Gemini atteinte. Attendez un peu avant de relancer la génération.", "Gemini quota or temporary limit reached. Wait a little before generating again."], ["⚠️ Gemini est temporairement indisponible. Réessayez dans quelques secondes.", "⚠️ Gemini is temporarily unavailable. Try again in a few seconds."], ["⚠️ La limite temporaire de Gemini a été atteinte. Attendez un peu puis réessayez.", "⚠️ Gemini's temporary limit was reached. Wait a little then try again."], ["⚠️ Impossible de générer les flashcards à partir du contexte.", "⚠️ Unable to generate flashcards from the context."], ["⚠️ Impossible de générer le quiz.", "⚠️ Unable to generate the quiz."], ["⚠️ Sélectionnez d'abord un cours.", "⚠️ Select a course first."], ["⚠️ Aucun document sélectionné.", "⚠️ No document selected."], ["❌ Document vide.", "❌ Empty document."], ["❌ Le modèle n'a renvoyé aucune flashcard valide.", "❌ The model returned no valid flashcard."], ["⏳ Génération des flashcards…", "⏳ Generating flashcards…"], ["⏳ Génération du quiz…", "⏳ Generating the quiz…"], ["⏳ Génération du résumé…", "⏳ Generating the summary…"], ["🔁 Quiz relancé.", "🔁 Quiz restarted."], ["⚠️ Générez d'abord un quiz.", "⚠️ Generate a quiz first."], ["ℹ️ Réponse déjà validée : passez à la suite.", "ℹ️ Answer already validated: move on."], ["⚠️ Sélectionnez une réponse avant de valider.", "⚠️ Select an answer before validating."], ["✅ Bonne réponse.", "✅ Correct answer."], ["❌ Réponse incorrecte. Consultez l'explication.", "❌ Incorrect answer. Check the explanation."], ["⚠️ Validez d'abord cette réponse.", "⚠️ Validate this answer first."], ["Console d'administration", "Administration console"], ["Suivi, maintenance et gestion des comptes AKORI", "Monitoring, maintenance and account management for AKORI"], ["← Retour à l'application", "← Back to the app"], ["↻ Actualiser", "↻ Refresh"], ["Utilisateurs", "Users"], ["Activité", "Activity"], ["Maintenance", "Maintenance"], ["Nouveau mot de passe", "New password"], ["Activer / Désactiver", "Enable / Disable"], ["Réinitialiser le mot de passe", "Reset the password"], ["Promouvoir / Rétrograder", "Promote / Demote"], ["Supprimer le compte", "Delete the account"], ["Je confirme la suppression définitive du compte et de ses données", "I confirm the permanent deletion of the account and its data"], ["Sauvegarde complète (ZIP)", "Full backup (ZIP)"], ["Recharger les index", "Reload the indexes"], ["Purger les connexions expirées", "Purge expired sign-ins"], ["Alléger le journal", "Trim the log"], ["Sauvegarde", "Backup"], ["Comptes", "Accounts"], ["Actifs (24 h)", "Active (24 h)"], ["Stockage utilisé", "Storage used"], ["Requêtes IA", "AI requests"], ["Jetons estimés", "Estimated tokens"], ["Erreurs (24 h)", "Errors (24 h)"], ["Sessions en ligne", "Online sessions"], ["Modèle principal", "Main model"], ["Modèles de secours", "Fallback models"], ["Clé API Gemini", "Gemini API key"], ["Disponibilité", "Uptime"], ["Dossier de données", "Data folder"], ["Taille PDF maximale", "Maximum PDF size"], ["✅ configurée", "✅ configured"], ["⛔ Accès réservé à l'administrateur.", "⛔ Reserved for the administrator."], ["⚠️ Sélectionnez un utilisateur.", "⚠️ Select a user."], ["⚠️ Vous ne pouvez pas désactiver votre propre compte.", "⚠️ You cannot disable your own account."], ["⚠️ Vous ne pouvez pas supprimer votre propre compte.", "⚠️ You cannot delete your own account."], ["⚠️ Il doit rester au moins un administrateur.", "⚠️ At least one administrator must remain."], ["⚠️ Cochez la confirmation pour supprimer définitivement ce compte et ses données.", "⚠️ Tick the confirmation to permanently delete this account and its data."], ["Rôle", "Role"], ["Statut", "Status"], ["Créé le", "Created on"], ["Dernière connexion", "Last sign-in"], ["Connexions", "Sign-ins"], ["Cours", "Courses"], ["Échanges", "Exchanges"], ["Quiz", "Quizzes"], ["Stockage", "Storage"], ["Actif", "Active"], ["Désactivé", "Disabled"], ["Date", "Date"], ["Événement", "Event"], ["Détail", "Detail"], ["⚠️ Session expirée : rechargez la page pour vous reconnecter.", "⚠️ Session expired: reload the page to sign in again."], ["Gemini met trop de temps à répondre. Réessayez dans un instant.", "Gemini is taking too long to answer. Try again in a moment."], ["Content de te revoir", "Good to see you again"], ["Connecte-toi pour accéder à tes cours", "Sign in to access your courses"], ["Email", "Email"], ["Mot de passe oublié ?", "Forgot your password?"], ["Pas encore de compte ?", "No account yet?"], ["Crée ton compte", "Create your account"], ["Gratuit, sans carte bancaire", "Free, no credit card"], ["Déjà un compte ?", "Already have an account?"], ["ton@email.com", "you@email.com"], ["8 caractères minimum", "8 characters minimum"], ["Comment tu t'appelles ?", "What's your name?"], ["Et quel est ton niveau scolaire ?", "And what's your school level?"], ["Prénom", "First name"], ["Ton prénom", "Your first name"], ["Niveau", "Level"], ["Objectif", "Goal"], ["🏫 Collège\nDe la 6ème à la 3ème", "🏫 Middle school\nGrades 6 to 9"], ["🎓 Lycée\nSeconde, Première, Terminale", "🎓 High school\nYears 10 to 12"], ["🎯 Études supérieures\nUniversité, Prépa, BTS...", "🎯 Higher education\nUniversity, prep school, vocational..."], ["📚 Réviser mes cours\nRelire, comprendre et mémoriser régulièrement", "📚 Revise my courses\nReread, understand and memorize regularly"], ["📝 Préparer un examen\nFlashcards et quiz avant le jour J", "📝 Prepare for an exam\nFlashcards and quizzes before the big day"], ["🧠 Mieux comprendre un chapitre\nPoser mes questions directement au cours", "🧠 Understand a chapter better\nAsk my questions directly to the course"], ["Continuer", "Continue"], ["Retour", "Back"], ["Accéder à AKORI", "Open AKORI"], ["Que veux-tu faire avec AKORI ?", "What do you want to do with AKORI?"], ["Choisis ton objectif principal", "Choose your main goal"], ["Dans quelle langue veux-tu travailler ?", "Which language do you want to work in?"], ["Tu pourras la changer à tout moment dans les paramètres", "You can change it at any time in the settings"], ["Ton espace est prêt. Importe ton premier cours en PDF et laisse AKORI générer tes flashcards, quiz et résumés.", "Your space is ready. Import your first course as a PDF and let AKORI generate your flashcards, quizzes and summaries."], ["⚠️ Adresse e-mail invalide.", "⚠️ Invalid email address."], ["⚠️ Un compte existe déjà avec cet e-mail.", "⚠️ An account already exists with this email."], ["⚠️ Entre ton prénom et choisis ton niveau.", "⚠️ Enter your first name and choose your level."], ["⚠️ Choisis ton objectif principal.", "⚠️ Choose your main goal."], ["⚠️ Ton prénom est trop long (40 caractères maximum).", "⚠️ Your first name is too long (40 characters maximum)."], ["ℹ️ Pour réinitialiser ton mot de passe, contacte l'administrateur d'AKORI.", "ℹ️ To reset your password, contact the AKORI administrator."], ["Stockage", "Storage"], ["✅ Google Drive", "✅ Google Drive"], ["⚠️ Temporaire (non sauvegardé)", "⚠️ Temporary (not backed up)"], ["⏳ Mise à jour de l'index du cours (une seule fois)…", "⏳ Updating the course index (one time only)…"], ["OCR (PDF scannés)", "OCR (scanned PDFs)"], ["désactivé", "disabled"], ["⚠️ Aucun texte n'a pu être lu dans ce PDF scanné (OCR sans résultat).", "⚠️ No text could be read in this scanned PDF (OCR returned nothing)."], ["Tester Gemini", "Test Gemini"], ["Profil", "Profile"], ["Mon profil", "My profile"], ["Ajoutez votre photo et ajustez vos informations. Elles apparaissent dans le menu et sur l'accueil.", "Add your photo and adjust your information. They appear in the menu and on the home page."], ["Ajouter une photo", "Add a photo"], ["Retirer la photo", "Remove the photo"], ["Enregistrer", "Save"], ["Ajoutez une photo pour personnaliser votre espace.", "Add a photo to personalize your space."], ["Collège", "Middle school"], ["Lycée", "High school"], ["Études supérieures", "Higher education"], ["Réviser mes cours", "Revise my courses"], ["Préparer un examen", "Prepare for an exam"], ["Mieux comprendre un chapitre", "Understand a chapter better"], ["✅ Photo de profil enregistrée.", "✅ Profile photo saved."], ["✅ Photo retirée.", "✅ Photo removed."], ["✅ Profil enregistré.", "✅ Profile saved."], ["⚠️ Image trop volumineuse (8 Mo maximum).", "⚠️ Image too large (8 MB maximum)."], ["⚠️ Image illisible : choisissez un fichier JPG ou PNG.", "⚠️ Unreadable image: choose a JPG or PNG file."], ["Pas encore commencé : générez une série dans Flashcards.", "Not started: generate a set in Flashcards."], ["Pas encore commencé : terminez un quiz pour obtenir une moyenne.", "Not started: finish a quiz to get an average."], ["Pas encore commencé : lancez une colle orale.", "Not started: start an oral exam."], ["Générez vos flashcards pour commencer à mémoriser.", "Generate your flashcards to start memorizing."], ["Terminez un quiz pour mesurer ce que vous retenez.", "Finish a quiz to measure what you retain."], ["Passez une colle orale pour vous entraîner à expliquer le cours.", "Take an oral exam to practice explaining the course."], ["Bravo : les trois activités sont lancées. Continuez pour monter vers 100 %.", "Well done: all three activities are started. Keep going towards 100%."], ["question(s) posée(s) à l'assistant", "question(s) asked to the assistant"], ["Résumé :", "Summary:"], ["généré", "generated"], ["non généré", "not generated"], ["chapitre(s) épinglé(s) dans À revoir", "chapter(s) pinned in To review"], ["d'après vos réponses de quiz sur ce cours", "based on your quiz answers for this course"], ["Moyenne de la progression de tous vos cours. Chaque cours compte 3 activités (flashcards, quiz, colle orale) : une activité non commencée compte pour 0 %.", "Average progress of all your courses. Each course counts 3 activities (flashcards, quiz, oral exam): an activity not started counts as 0%."], ["Le détail pédagogique reste lié au cours sélectionné : activités, points forts, points faibles et prochaine étape.", "The detailed breakdown stays linked to the selected course: activities, strengths, weaknesses and next step."], ["Résumé · Flashcards · Quiz / QCM · Colle orale · Assistant IA", "Summary · Flashcards · Quiz / MCQ · Oral exam · AI Assistant"], ["AKORI transforme vos cours PDF en un espace de révision intelligent : résumé, flashcards roulette, quiz, colle orale et assistant RAG.", "AKORI turns your PDF courses into a smart revision space: summary, roulette flashcards, quiz, oral exam and RAG assistant."], ["Passages indexés", "Indexed passages"], ["dans votre espace", "in your space"], ["Questions posées", "Questions asked"], ["Progression du cours actif", "Active course progress"], ["flashcards, quiz et colle orale", "flashcards, quiz and oral exam"], ["💡 Guide de révision : que faire avec chaque fonction ?", "💡 Revision guide: what to do with each feature"], ["Importez vos PDF, même scannés : AKORI lit le texte, le découpe et l'indexe.", "Import your PDFs, even scanned ones: AKORI reads the text, splits it and indexes it."], ["Les points clés du cours en un coup d'œil, dans votre langue.", "The key points of the course at a glance, in your language."], ["Posez vos questions : la réponse s'appuie sur votre cours, avec la page citée. Épinglez ou écoutez-la.", "Ask your questions: the answer relies on your course, with the page cited. Pin it or listen to it."], ["Au moins 7 cartes en mode roulette : cliquez pour stopper, la réponse s'efface à chaque relance.", "At least 7 cards in roulette mode: click to stop, the answer is hidden at each restart."], ["Testez-vous : correction expliquée, points forts et faibles dans Progression.", "Test yourself: explained correction, strengths and weaknesses in Progress."], ["Répondez à l'oral ou à l'écrit : note sur 10 d'après votre cours et page à relire.", "Answer orally or in writing: score out of 10 based on your course and the page to reread."], ["Retrouvez les réponses que vous avez épinglées, cours par cours.", "Find the answers you pinned, course by course."], ["Importer un PDF →", "Import a PDF →"], ["Générer le résumé →", "Generate the summary →"], ["Poser une question →", "Ask a question →"], ["Lancer la roulette →", "Start the roulette →"], ["Passer un quiz →", "Take a quiz →"], ["Passer une colle →", "Take an oral →"], ["Ouvrir À revoir →", "Open To review →"], ["Continuer", "Continue"], ["Commencer", "Start"], ["PROCHAINE ÉTAPE", "NEXT STEP"], ["Moyenne des colles", "Oral exam average"], ["tous cours confondus", "all courses combined"], ["au moins une activité faite", "at least one activity done"], ["Colle orale", "Oral exam"], ["AKORI vous interroge sur votre cours, comme à l'oral. Répondez à l'écrit ou à la voix : la correction se base uniquement sur le contenu du cours et vous indique la page à relire.", "AKORI quizzes you on your course, like an oral exam. Answer in writing or by voice: the grading relies only on the course content and tells you which page to reread."], ["Prêt pour votre colle ?", "Ready for your oral?"], ["Cliquez sur « Nouvelle question » : AKORI vous interroge sur votre cours, comme à l'oral.", "Click “New question”: AKORI quizzes you on your course, like an oral exam."], ["Nouvelle question", "New question"], ["Dicter ma réponse", "Dictate my answer"], ["Votre réponse", "Your answer"], ["Écrivez votre réponse ici, ou cliquez sur « Dicter ma réponse »…", "Write your answer here, or click “Dictate my answer”…"], ["Corriger ma réponse", "Grade my answer"], ["Question orale", "Oral question"], ["Très bien", "Very good"], ["Correct, à compléter", "Correct, needs completing"], ["À reprendre", "To redo"], ["Points maîtrisés", "Mastered points"], ["À retravailler", "To work on"], ["Aucun point clé repéré.", "No key point found."], ["Rien d'oublié, bravo.", "Nothing forgotten, well done."], ["À relire", "To reread"], ["Réponse modèle", "Model answer"], ["Mes dernières colles", "My latest orals"], ["Répondez à l'écrit ou à la voix, puis cliquez sur « Corriger ma réponse ».", "Answer in writing or by voice, then click “Grade my answer”."], ["⚠️ Cliquez d'abord sur « Nouvelle question ».", "⚠️ Click “New question” first."], ["⚠️ Écrivez ou dictez une réponse avant de la faire corriger.", "⚠️ Write or dictate an answer before grading it."], ["Correction approximative (IA indisponible).", "Approximate grading (AI unavailable)."], ["Liste des utilisateurs", "User list"], ["Rechercher un utilisateur", "Search a user"], ["N°", "No."], ["Profil", "Profile"], ["E-mail", "Email"], ["Mot de passe", "Password"], ["Chiffré", "Encrypted"], ["Modifier", "Edit"], ["Supprimer", "Delete"], ["Générer un mot de passe temporaire", "Generate a temporary password"], ["Sélectionnez un utilisateur dans la liste ou cliquez sur « Modifier ».", "Select a user in the list or click “Edit”."], ["Mot de passe chiffré : personne ne peut le lire. Définissez-en un nouveau ou générez un mot de passe temporaire.", "Encrypted password: nobody can read it. Set a new one or generate a temporary password."], ["Créé le", "Created on"], ["Afficher le mot de passe", "Show password"], ["Épingler comme chapitre", "Pin as chapter"], ["Lire à voix haute", "Read aloud"], ["Arrêter la lecture", "Stop reading"], ["Épinglé ✓", "Pinned ✓"], ["Lecture vocale indisponible", "Voice reading unavailable"], ["Extrait", "Excerpt"], ["Chapitres", "Chapters"], ["Chapitres épinglés", "Pinned chapters"], ["Les réponses de l'assistant que vous épinglez depuis le chat sont rangées ici, cours par cours. Relisez-les, ou écoutez-les, avant l'examen.", "The assistant answers you pin from the chat are kept here, course by course. Reread them, or listen to them, before the exam."], ["Aucun chapitre épinglé pour ce cours.", "No pinned chapter for this course."], ["Dans l'assistant, cliquez sur « Épingler comme chapitre » sous une réponse utile.", "In the assistant, click “Pin as chapter” under a useful answer."], ["Retirer", "Remove"], ["📌 Chapitre épinglé", "📌 Chapter pinned"], ["Retrouvez-le dans À revoir.", "Find it in To review."], ["Recherche (médiane)", "Search (median)"], ["1er mot (médiane)", "First word (median)"], ["Réponse complète (médiane)", "Full answer (median)"], ["Réponse complète (95e centile)", "Full answer (95th percentile)"], ["Questions hors cours refusées", "Off-topic questions declined"], ["Modèle d'embeddings", "Embedding model"], ["Seuil de pertinence", "Relevance threshold"], ["Mesures sur", "Measured over"]];
+  const PATTERNS = [["^(\\d+) maîtrisée\\(s\\) sur (\\d+) · (\\d+) à revoir$", "$1 mastered out of $2 · $3 to review"], ["^(\\d+) maîtrisée\\(s\\) sur (\\d+)$", "$1 mastered out of $2"], ["^(\\d+) quiz terminé\\(s\\) · moyenne (\\d+) % sur (\\d+) questions$", "$1 quiz(zes) completed · average $2% over $3 questions"], ["^(\\d+) colle\\(s\\) · moyenne (.+)\\/10$", "$1 oral(s) · average $2/10"], ["^Progression du cours · (.*)$", "Course progress · $1"], ["^Moyenne de 3 activités : flashcards, quiz et colle orale \\((\\d)\\/3 commencées\\)\\. Une activité non commencée compte pour 0 %\\.$", "Average of 3 activities: flashcards, quiz and oral exam ($1/3 started). An activity not started counts as 0%."], ["^dans le cours actif \\((\\d+) au total\\)$", "in the active course ($1 in total)"], ["^à l'assistant sur ce cours \\((\\d+) sur tous vos cours\\)$", "to the assistant on this course ($1 across all your courses)"], ["^(\\d+) quiz terminé\\(s\\), tous cours$", "$1 quiz(zes) completed, all courses"], ["^(\\d+) colle\\(s\\), tous cours$", "$1 oral(s), all courses"], ["^Flashcards (.+) · Quiz (.+) · Colle (.+)$", "Flashcards $1 · Quiz $2 · Oral $3"], ["^Revoyez vos (\\d+) flashcard\\(s\\) marquée\\(s\\) « à revoir »\\.$", "Review your $1 flashcard(s) marked “to review”."], ["^(\\d+) passages indexés · Progression du cours (\\d+)%$", "$1 indexed passages · Course progress $2%"], ["^⏳ Préparation de la question… \\((\\d+) s\\)$", "⏳ Preparing the question… ($1 s)"], ["^⏳ Correction en cours… \\((\\d+) s\\)$", "⏳ Grading in progress… ($1 s)"], ["^✅ Note : (\\d+)\\/10$", "✅ Score: $1/10"], ["^(\\d+) séance\\(s\\) · moyenne (.+)\\/10$", "$1 session(s) · average $2/10"], ["^Source : (.*)$", "Source: $1"], ["^(\\d+) cours · (\\d+) échanges · (.+)$", "$1 courses · $2 exchanges · $3"], ["^(\\d+) connexions$", "$1 sign-ins"], ["^✅ Mot de passe temporaire de « (.+) » : (.+) — à lui communiquer \\(affiché une seule fois\\)\\.$", "✅ Temporary password of “$1”: $2 — give it to the user (shown only once)."], ["^ℹ️ Pour supprimer « (.+) » : cochez la confirmation, puis cliquez sur « Supprimer le compte »\\.$", "ℹ️ To delete “$1”: tick the confirmation, then click “Delete the account”."], ["^ℹ️ Modification de « (.+) » : choisissez une action ci-dessous\\.$", "ℹ️ Editing “$1”: choose an action below."], ["^Clé API Gemini invalide : elle contient des caractères non autorisés \\(accents, symboles\\)\\. Collez la clé exacte, qui commence par AIza, dans le secret GEMINI_API_KEY\\.$", "Invalid Gemini API key: it contains forbidden characters (accents, symbols). Paste the exact key, starting with AIza, into the GEMINI_API_KEY secret."], ["^Gemini est très sollicité en ce moment\\. Réessayez dans une dizaine de secondes\\.(.*)$", "Gemini is very busy right now. Try again in about ten seconds.$1"], ["^Quota Gemini atteint : la limite de requêtes de votre clé est épuisée \\(par minute ou par jour\\)\\. Attendez une minute ou utilisez une autre clé\\.(.*)$", "Gemini quota reached: your key's request limit is used up (per minute or per day). Wait a minute or use another key.$1"], ["^Aucun modèle Gemini n'est accessible avec cette clé \\(404\\)\\. Vérifiez GEMINI_API_KEY et les noms de modèles\\.(.*)$", "No Gemini model is available with this key (404). Check GEMINI_API_KEY and the model names.$1"], ["^Connexion à Gemini impossible \\(réseau ou délai dépassé\\)\\. Réessayez dans un instant\\.(.*)$", "Cannot reach Gemini (network or timeout). Try again in a moment.$1"], ["^⏳ Lecture OCR des pages scannées (\\d+)\\/(\\d+)…$", "⏳ Reading scanned pages with OCR $1/$2…"], ["^✅ '(.+)' indexé avec succès \\((\\d+) fragments, OCR sur (\\d+) pages\\)\\.$", "✅ '$1' indexed successfully ($2 fragments, OCR on $3 pages)."], ["^Chapitre (\\d+)$", "Chapter $1"], ["^(\\d+) réponse\\(s\\)$", "$1 answer(s)"], ["^✅ '(.+)' indexé avec succès \\((\\d+) fragments\\)\\.$", "✅ '$1' indexed successfully ($2 fragments)."], ["^✅ '(.+)' est déjà indexé : réutilisé instantanément\\.$", "✅ '$1' is already indexed: reused instantly."], ["^❌ Erreur lors de l'indexation : (.*)$", "❌ Indexing error: $1"], ["^⏳ Indexation (\\d+)\\/(\\d+)…$", "⏳ Indexing $1/$2…"], ["^⚠️ Fichier trop volumineux \\(maximum (\\d+) Mo\\)\\.$", "⚠️ File too large (maximum $1 MB)."], ["^✅ (\\d+) flashcards prêtes !$", "✅ $1 flashcards ready!"], ["^⚠️ Seulement (\\d+) flashcard\\(s\\) obtenue\\(s\\) : il en faut au moins (\\d+)\\. Relancez la génération\\.$", "⚠️ Only $1 flashcard(s) obtained: at least $2 are needed. Generate again."], ["^❌ Erreur : (.*)$", "❌ Error: $1"], ["^⚠️ Génération impossible : (.*)$", "⚠️ Generation failed: $1"], ["^✅ Quiz de (\\d+) questions généré\\.$", "✅ Quiz of $1 questions generated."], ["^🎯 Quiz terminé : (\\d+)\\/(\\d+)\\.$", "🎯 Quiz completed: $1/$2."], ["^Score : (\\d+)$", "Score: $1"], ["^(\\d+)% de bonnes réponses$", "$1% correct answers"], ["^Bonne réponse : (.*)$", "Correct answer: $1"], ["^Le titre du document est : (.*)$", "The title of the document is: $1"], ["^QUIZ \\/ QCM · (.*)$", "QUIZ / MCQ · $1"], ["^(\\d+) fragments indexés · Progression (\\d+)% · RAG local$", "$1 indexed fragments · Progress $2% · Local RAG"], ["^Progression réelle · (.*)$", "Real progress · $1"], ["^Ajouté le (.*)$", "Added on $1"], ["^Indexé · (\\d+) fragments$", "Indexed · $1 fragments"], ["^✅ Compte « (.+) » (activé|désactivé)\\.$", "✅ Account “$1” updated."], ["^✅ Mot de passe de « (.+) » réinitialisé.*$", "✅ Password of “$1” reset (their remembered sign-ins are revoked)."], ["^✅ « (.+) » est maintenant (administrateur|utilisateur)\\.$", "✅ “$1” role updated."], ["^✅ Compte « (.+) » et toutes ses données supprimés\\.$", "✅ Account “$1” and all its data deleted."], ["^✅ Sauvegarde créée \\((.+)\\)\\.$", "✅ Backup created ($1)."], ["^✅ (\\d+) connexion\\(s\\) mémorisée\\(s\\) expirée\\(s\\) purgée\\(s\\)\\.$", "✅ $1 expired remembered sign-in(s) purged."], ["^✅ Journal allégé : (\\d+) ligne\\(s\\) ancienne\\(s\\) supprimée\\(s\\)\\.$", "✅ Log trimmed: $1 old line(s) removed."], ["^✅ Index et cours rechargés.*$", "✅ Indexes and courses will be reloaded from disk on each user's next action."], ["^⏳ Génération des flashcards… \\((\\d+) s\\)$", "⏳ Generating flashcards… ($1 s)"], ["^⏳ Génération du quiz… \\((\\d+) s\\)$", "⏳ Generating the quiz… ($1 s)"], ["^⏳ Génération du résumé… \\((\\d+) s\\)$", "⏳ Generating the summary… ($1 s)"], ["^C'est parti (.+) !$", "Let's go $1!"], ["^Bonjour (.+) 👋$", "Hello $1 👋"], ["^⚠️ Mot de passe trop court \\((\\d+) caractères minimum\\)\\.$", "⚠️ Password too short ($1 characters minimum)."]].map(([re, to]) => [new RegExp(re), to]);
   const EXACT = new Map(I18N.map(([fr, en]) => [fr.trim(), en]));
   const codeOf = (label) => /English/.test(String(label)) ? 'en' : 'fr';
   const labelOf = (code) => code === 'en' ? 'English' : 'Français';
@@ -4346,6 +4481,10 @@ TOKEN_STORE_JS = r"""
 
 SIDEBAR_TOGGLE_JS = r"""
 () => {
+  document.body.classList.add('sb-instant');            // réduction / ouverture au clic : immédiate, sans animation
+  window.__sbSuppress = true;                           // le curseur est encore sur le menu : il ne le rouvre pas avant d'en sortir
+  document.body.classList.remove('sb-hover');
+  window.setTimeout(() => document.body.classList.remove('sb-instant'), 420);
   const closed = document.body.classList.toggle('sidebar-collapsed');
   try { localStorage.setItem('akori-sidebar', closed ? 'closed' : 'open'); } catch (e) {}
 }
@@ -4472,6 +4611,62 @@ AKORI_NAV_JS = r"""
       window.setTimeout(() => { const card = document.getElementById('admin-card'); if (card) card.scrollIntoView({ behavior: 'smooth', block: 'center' }); }, 250);
     }
   });
+  // Ouverture du menu réduit au survol (gérée ici pour pouvoir la suspendre juste après un clic sur ☰)
+  document.addEventListener('mouseover', (e) => {
+    const inside = !!(e.target.closest && e.target.closest('#sidebar'));
+    if (!inside) window.__sbSuppress = false;
+    document.body.classList.toggle('sb-hover', inside && !window.__sbSuppress);
+  });
+  document.documentElement.addEventListener('mouseleave', () => { window.__sbSuppress = false; document.body.classList.remove('sb-hover'); });
+  // Cartes du guide / boutons « Commencer » : ouvrent directement la page correspondante
+  document.addEventListener('click', (event) => {
+    const go = event.target.closest('.ak-go');
+    if (go) {
+      const m = go.className.match(/ak-t-(\w+)/);
+      const nav = m && document.getElementById('nav-' + m[1]);
+      if (nav) { event.preventDefault(); nav.click(); window.scrollTo({ top: 0, behavior: 'smooth' }); }
+      return;
+    }
+    if (event.target.closest('#user-badge')) { const p = document.getElementById('nav-profile'); if (p) p.click(); }
+  });
+  // Compteurs animés (0 -> valeur) à l'apparition des chiffres
+  const countUp = (el) => {
+    if (el.__cu || !el.firstChild || el.firstChild.nodeType !== 3) return;
+    const m = (el.textContent || '').trim().match(/^(\d+)(\s*%?)$/);
+    el.__cu = true;
+    if (!m || +m[1] === 0) return;
+    const to = +m[1], suffix = m[2], node = el.firstChild, t0 = performance.now();
+    const step = (t) => {
+      const k = Math.min(1, (t - t0) / 800);
+      node.nodeValue = Math.round(to * (1 - Math.pow(1 - k, 3))) + suffix;
+      if (k < 1) requestAnimationFrame(step);
+    };
+    node.nodeValue = '0' + suffix;
+    requestAnimationFrame(step);
+  };
+  const scanCounters = (root) => {
+    if (!root || root.nodeType !== 1) return;
+    if (root.classList && root.classList.contains('cu')) countUp(root);
+    if (root.querySelectorAll) root.querySelectorAll('.cu').forEach(countUp);
+  };
+  new MutationObserver((muts) => muts.forEach((m) => m.addedNodes.forEach(scanCounters))).observe(document.body, { childList: true, subtree: true });
+  scanCounters(document.body);
+  // Champs de connexion : pas de suggestions de saisie automatique du navigateur (plus de surbrillance gênante)
+  const hardenAuth = () => {
+    [['li-user', 'off'], ['su-user', 'off'], ['li-pass', 'new-password'], ['su-pass', 'new-password'], ['su-pass2', 'new-password']].forEach(([id, ac]) => {
+      const box = document.getElementById(id);
+      const input = box && box.querySelector('input, textarea');
+      if (!input || input.__akHard) return;
+      input.__akHard = true;
+      input.setAttribute('autocomplete', ac);
+      input.setAttribute('name', 'ak_' + id + '_' + Math.random().toString(36).slice(2, 7));
+      input.setAttribute('autocapitalize', 'off'); input.setAttribute('autocorrect', 'off'); input.setAttribute('spellcheck', 'false');
+      input.setAttribute('data-lpignore', 'true'); input.setAttribute('data-form-type', 'other');
+    });
+  };
+  new MutationObserver(hardenAuth).observe(document.body, { childList: true, subtree: true });
+  hardenAuth();
+
   // Recherche instantanée dans la liste des utilisateurs
   document.addEventListener('input', (event) => {
     const box = event.target.closest && event.target.closest('#admin-search');
@@ -4490,14 +4685,99 @@ AKORI_NAV_JS = r"""
 # =============================================================================
 # CONNEXION, SESSIONS ET CONSOLE D'ADMINISTRATION
 # =============================================================================
+def _avatar_html(key, css="ub-avatar"):
+    """Photo de profil si elle existe, sinon l'initiale du prénom."""
+    u = _users().get(key, {}) if key else {}
+    name = _display_name(key) if key else ""
+    photo = u.get("avatar") or ""
+    if photo.startswith("data:image/"):
+        return f"<img class='{css}' src='{photo}' alt='{_escape_html(name)}'>"
+    return f"<div class='{css}'>{_escape_html(name[:1].upper() or '?')}</div>"
+
+
 def _user_badge_html(key):
     if not key:
         return ""
     u = _users().get(key, {})
     name = _display_name(key)
     role = "Administrateur" if u.get("role") == "admin" else "Utilisateur"
-    return (f"<div class='user-badge'><div class='ub-avatar'>{_escape_html(name[:1].upper() or '?')}</div>"
+    return (f"<div class='user-badge' title='Mon profil'>{_avatar_html(key)}"
             f"<div class='ub-text'><b>{_escape_html(name)}</b><span>{role}</span></div></div>")
+
+
+# ---------------- profil : photo, prénom, niveau, objectif
+PROF_LEVELS = [("Collège", "college"), ("Lycée", "lycee"), ("Études supérieures", "superieur")]
+PROF_GOALS = [("Réviser mes cours", "revise"), ("Préparer un examen", "exam"), ("Mieux comprendre un chapitre", "understand")]
+
+
+def _profile_card(key):
+    if not key:
+        return ""
+    u = _users().get(key, {})
+    photo = u.get("avatar") or ""
+    name = _display_name(key)
+    face = (f"<img class='prof-avatar' src='{photo}' alt=''>" if photo.startswith("data:image/")
+            else f"<div class='prof-avatar'>{_escape_html(name[:1].upper() or '?')}</div>")
+    return (f"<div class='prof-card'>{face}<div><b>{_escape_html(name)}</b><small>{_escape_html(str(u.get('username', key)))}</small>"
+            f"<small>Ajoutez une photo pour personnaliser votre espace.</small></div></div>")
+
+
+def profile_view():
+    key = _CUR_USER.get()
+    if not key:
+        return "", "", None, None, ""
+    p = _profile(key)
+    return _profile_card(key), p["name"], p["level"] or None, p["goal"] or None, ""
+
+
+def _make_avatar(path):
+    """Photo -> carré 192 px en JPEG, sous forme d'adresse data: (petite, stockée avec le compte)."""
+    import base64
+    from PIL import Image, ImageOps   # Pillow est installé avec Gradio
+    with Image.open(path) as im:
+        im = ImageOps.exif_transpose(im).convert("RGB")
+        side = min(im.size)
+        left, top = (im.width - side) // 2, (im.height - side) // 2
+        im = im.crop((left, top, left + side, top + side)).resize((192, 192))
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=84, optimize=True)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def profile_photo_upload(file_path, doc_name=None):
+    key = _CUR_USER.get()
+    if not key:
+        return gr.update(), gr.update(), "⚠️ Session expirée : rechargez la page pour vous reconnecter.", gr.update()
+    path = getattr(file_path, "name", file_path)
+    if not path:
+        return gr.update(), gr.update(), "", gr.update()
+    try:
+        if os.path.getsize(path) > 8 * 1024 * 1024:
+            return gr.update(), gr.update(), "⚠️ Image trop volumineuse (8 Mo maximum).", gr.update()
+        _save_profile(key, avatar=_make_avatar(path))
+    except Exception:
+        return gr.update(), gr.update(), "⚠️ Image illisible : choisissez un fichier JPG ou PNG.", gr.update()
+    _log("profile_photo")
+    return _profile_card(key), _user_badge_html(key), "✅ Photo de profil enregistrée.", dashboard_html(doc_name)
+
+
+def profile_photo_remove(doc_name=None):
+    key = _CUR_USER.get()
+    if key:
+        _save_profile(key, avatar="")
+    return _profile_card(key), _user_badge_html(key), "✅ Photo retirée.", dashboard_html(doc_name)
+
+
+def profile_save(name, level, goal, doc_name=None):
+    key = _CUR_USER.get()
+    if not key:
+        return gr.update(), gr.update(), "⚠️ Session expirée : rechargez la page pour vous reconnecter.", gr.update()
+    name = str(name or "").strip()
+    if not name or len(name) > 40:
+        return gr.update(), gr.update(), "⚠️ Ton prénom est trop long (40 caractères maximum)." if name else "⚠️ Entre ton prénom et choisis ton niveau.", gr.update()
+    _save_profile(key, name=name, level=level or "", goal=goal or "")
+    _log("profile_save")
+    return _profile_card(key), _user_badge_html(key), "✅ Profil enregistré.", dashboard_html(doc_name)
 
 
 def _views_for(user, status="", token=None):
@@ -4765,7 +5045,7 @@ def _admin_overview():
         rows.append(
             "<tr>"
             f"<td class='ad-no'>{index}</td>"
-            f"<td><div class='ad-profile'><span class='ad-avatar'>{_escape_html((name or ident)[:1].upper())}</span>"
+            f"<td><div class='ad-profile'>{_avatar_html(key, 'ad-avatar')}"
             f"<span><b>{_escape_html(name or ident)}</b><small>{st['docs']} cours · {st['chats']} échanges · {_format_file_size(st['size'])}</small></span></div></td>"
             f"<td>{_escape_html(ident)}</td>"
             f"<td><span class='ad-pill {'ad-admin' if is_admin else 'ad-user'}'>{'Administrateur' if is_admin else 'Utilisateur'}</span></td>"
@@ -4861,7 +5141,7 @@ def admin_user_card(target):
     is_admin = u.get("role") == "admin"
     return (
         "<div class='ad-card'>"
-        f"<div class='ad-card-head'><span class='ad-avatar ad-avatar-lg'>{_escape_html((name or key)[:1].upper())}</span>"
+        f"<div class='ad-card-head'>{_avatar_html(key, 'ad-avatar ad-avatar-lg')}"
         f"<div><b>{_escape_html(name or key)}</b><small>{_escape_html(str(u.get('username', key)))}</small></div>"
         f"<span class='ad-pill {'ad-admin' if is_admin else 'ad-user'}'>{'Administrateur' if is_admin else 'Utilisateur'}</span>"
         f"<span class='ad-pill {'ad-on' if u.get('active', True) else 'ad-off'}'>{'Actif' if u.get('active', True) else 'Désactivé'}</span></div>"
@@ -5309,6 +5589,19 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
                             gr.HTML("<div class='set-text'><div class='set-title'>Langue</div><div class='set-desc'>Langue de l'interface et des réponses générées par l'IA.</div></div>")
                             lang_choice = gr.Radio(choices=LANG_CHOICES, value="Français", show_label=False, container=False, elem_id="lang-choice", scale=0)
 
+                    with gr.Tab("Profil", id="profile"):
+                        gr.Markdown("## Mon profil")
+                        gr.Markdown("Ajoutez votre photo et ajustez vos informations. Elles apparaissent dans le menu et sur l'accueil.")
+                        prof_card = gr.HTML("")
+                        with gr.Row():
+                            prof_photo = gr.UploadButton("Ajouter une photo", file_types=["image"], file_count="single", type="filepath", elem_id="prof-photo")
+                            prof_remove = gr.Button("Retirer la photo", elem_id="prof-remove")
+                        prof_name = gr.Textbox(label="Prénom", placeholder="Ton prénom", elem_id="prof-name")
+                        prof_level = gr.Radio(choices=PROF_LEVELS, label="Niveau", elem_id="prof-level")
+                        prof_goal = gr.Radio(choices=PROF_GOALS, label="Objectif", elem_id="prof-goal")
+                        prof_save = gr.Button("Enregistrer", variant="primary", elem_id="prof-save")
+                        prof_status = gr.Markdown("", elem_id="prof-status")
+
                     with gr.Tab("Historique", id="history"):
                         gr.Markdown("## Historique du cours actif")
                         history_box = gr.HTML(history_view(doc_selector.value))
@@ -5356,6 +5649,7 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
 
     # Bouton invisible : le navigateur le déclenche seul après une coupure réseau pour réafficher l'état enregistré.
     resync_btn = gr.Button("resync", elem_id="resync-btn", elem_classes="akori-hidden")
+    nav_profile = gr.Button("profil", elem_id="nav-profile", elem_classes="akori-hidden")
     # Relais cachés des boutons « Épingler » / « Retirer » (affichés dans le HTML du chat, donc hors de Gradio).
     pin_payload = gr.Textbox(elem_id="pin-payload", elem_classes="akori-hidden", show_label=False, container=False)
     pin_btn = gr.Button("pin", elem_id="pin-btn", elem_classes="akori-hidden")
@@ -5424,6 +5718,12 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
     nav_quiz.click(lambda: gr.Tabs(selected="quiz"), outputs=tabs, queue=False)
     nav_summary.click(lambda: gr.Tabs(selected="summary"), outputs=tabs, queue=False)
     nav_oral.click(lambda: gr.Tabs(selected="oral"), outputs=tabs, queue=False)
+    nav_profile.click(lambda: gr.Tabs(selected="profile"), outputs=tabs, queue=False).then(
+        profile_view, None, [prof_card, prof_name, prof_level, prof_goal, prof_status], queue=False)
+    PROF_OUT = [prof_card, user_badge, prof_status, home_html]
+    prof_photo.upload(profile_photo_upload, [prof_photo, doc_selector], PROF_OUT, queue=False)
+    prof_remove.click(profile_photo_remove, [doc_selector], PROF_OUT, queue=False)
+    prof_save.click(profile_save, [prof_name, prof_level, prof_goal, doc_selector], PROF_OUT, queue=False)
     oral_new.click(oral_new_handler, [doc_selector, lang_choice, oral_state], [oral_state, oral_card, oral_answer, oral_result, oral_status], show_progress="hidden")
     oral_submit.click(oral_grade_handler, [oral_state, oral_answer, doc_selector, lang_choice], [oral_result, oral_status, oral_history], show_progress="hidden")
     oral_mic.click(None, None, None, js=ORAL_MIC_JS, queue=False)
