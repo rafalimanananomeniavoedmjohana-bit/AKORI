@@ -15,6 +15,7 @@ import json
 import os
 from datetime import datetime
 import random
+import socket
 import threading
 import re
 import time
@@ -498,6 +499,58 @@ def _read_log(limit=300):
 # ---- comptes ----
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
 EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]+\.[^@\s]{2,}$")
+STRICT_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]{1,64}@((?:[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,24})$")
+DISPOSABLE_DOMAINS = {"mailinator.com", "yopmail.com", "10minutemail.com", "guerrillamail.com", "tempmail.com", "trashmail.com", "sharklasers.com",
+                      "getnada.com", "throwawaymail.com", "maildrop.cc", "dispostable.com", "temp-mail.org", "fakeinbox.com", "mailnesia.com"}
+EMAIL_TYPOS = {"gmial.com": "gmail.com", "gmai.com": "gmail.com", "gmail.co": "gmail.com", "gamil.com": "gmail.com", "gnail.com": "gmail.com",
+               "gmail.con": "gmail.com", "hotmial.com": "hotmail.com", "hotmail.co": "hotmail.com", "yahooo.com": "yahoo.com", "yaho.com": "yahoo.com",
+               "outlok.com": "outlook.com", "outloook.com": "outlook.com"}
+
+
+def _domain_receives_mail(domain):
+  """True si le domaine existe et peut recevoir du courrier. En cas de doute (pas de réseau, délai dépassé), on accepte."""
+  result = {"ok": True}
+
+  def probe():
+    try:
+      try:
+        import dns.resolver                                    # dnspython, si présent : on cherche un enregistrement MX
+        resolver = dns.resolver.Resolver()
+        resolver.lifetime = 3
+        try:
+          resolver.resolve(domain, "MX")
+          return
+        except dns.resolver.NoAnswer:
+          resolver.resolve(domain, "A")
+          return
+      except ImportError:
+        socket.getaddrinfo(domain, None)
+    except Exception as e:
+      name = type(e).__name__
+      if name in ("NXDOMAIN", "NoAnswer", "NoNameservers") or (isinstance(e, socket.gaierror) and e.errno in (socket.EAI_NONAME, getattr(socket, "EAI_NODATA", -5))):
+        result["ok"] = False
+
+  t = threading.Thread(target=probe, daemon=True)
+  t.start()
+  t.join(4)
+  return result["ok"]
+
+
+def _email_problem(addr):
+  """Message d'erreur si l'adresse n'est pas une vraie adresse utilisable, sinon None."""
+  addr = str(addr or "").strip()
+  m = STRICT_EMAIL_RE.match(addr)
+  local = addr.split("@")[0]
+  if not m or local.startswith(".") or local.endswith(".") or ".." in local:
+    return "⚠️ Adresse e-mail invalide (exemple : prenom.nom@gmail.com)."
+  domain = m.group(1).lower()
+  if domain in EMAIL_TYPOS:
+    return f"⚠️ Vouliez-vous écrire @{EMAIL_TYPOS[domain]} ?"
+  if domain in DISPOSABLE_DOMAINS:
+    return "⚠️ Les adresses jetables ne sont pas acceptées : utilisez une adresse e-mail que vous consultez."
+  if os.getenv("AKORI_EMAIL_CHECK", "1") != "0" and not _domain_receives_mail(domain):
+    return f"⚠️ Le domaine « {domain} » n'existe pas ou ne reçoit pas d'e-mails."
+  return None
 MIN_PASSWORD = 8
 
 
@@ -517,6 +570,10 @@ def _create_user(identifier, password, role="user", allow_username=False, onboar
   password = str(password or "")
   if not (EMAIL_RE.match(ident) or (allow_username and USERNAME_RE.match(ident))) or len(ident) > 120:
     return False, "⚠️ Adresse e-mail invalide."
+  if not allow_username and role != "admin":
+    problem = _email_problem(ident)
+    if problem:
+      return False, problem
   if len(password) < MIN_PASSWORD:
     return False, f"⚠️ Mot de passe trop court ({MIN_PASSWORD} caractères minimum)."
   key = ident.lower()
@@ -766,6 +823,7 @@ def _doc_metadata(filename, data):
       "flash_index": int(data.get("flash_index", 0)),
       "quiz": data.get("quiz", {}),
       "summary_cache": data.get("summary_cache", {}),
+      "mindmap_cache": data.get("mindmap_cache", {}),
   }
 
 
@@ -856,6 +914,7 @@ def _load_user_documents(key):
           "flash_index": int(metadata.get("flash_index", 0)),
           "quiz": metadata.get("quiz", {}),
           "summary_cache": metadata.get("summary_cache", {}),
+          "mindmap_cache": metadata.get("mindmap_cache", {}),
       })
       docs[filename] = doc_entry
     except Exception as e:
@@ -1568,6 +1627,7 @@ def indexer_pdf_stream(file_path):
         "flash_index": keep.get("flash_index", 0),
         "quiz": keep.get("quiz", {}),
         "summary_cache": keep.get("summary_cache", {}),
+        "mindmap_cache": keep.get("mindmap_cache", {}),
         "chunks_count": total,
         "full_text": "",
         "title": _extract_document_title(texte_complet),
@@ -2201,13 +2261,17 @@ def dashboard_html(active_doc=None):
           "Marquez « Je savais » ou « À revoir » : les cartes à revoir reviennent dans votre plan."],
          "Mieux vaut 10 minutes chaque jour qu'une heure la veille : c'est la répétition espacée.", "Lancer la roulette"),
         ("quiz", "🎯", "Quiz / QCM", "Testez-vous : correction expliquée, points forts et points faibles.",
-         ["Générez un quiz de 5 questions.", "Répondez, validez, lisez l'explication, puis passez à la suite.",
-          "Vos erreurs alimentent la carte de vos lacunes et les pages à relire."],
+         ["Générez un quiz de 5 questions.", "Touchez une réponse : la correction et l'explication s'affichent aussitôt, sans valider.",
+          "Glissez vers la gauche pour passer à la question suivante. Vos erreurs alimentent la carte de vos lacunes."],
          "Un quiz raté n'est pas un échec : il indique exactement quelle page relire.", "Passer un quiz"),
         ("oral", "🎤", "Colle orale", "Répondez à l'oral ou à l'écrit, comme devant un examinateur.",
          ["AKORI choisit un passage de votre cours et pose une question ouverte.", "Dictez votre réponse au micro ou écrivez-la.",
           "Recevez une note sur 10, ce qui manquait, et la page à relire."],
          "Dire la réponse à voix haute révèle ce que vous maîtrisez vraiment.", "Passer une colle"),
+        ("mindmap", "🕸", "Mindmap", "La carte mentale du cours, d'un seul regard.",
+         ["Choisissez le cours actif puis lancez « Générer la mindmap ».", "Le thème est au centre, les grandes notions autour, leurs détails au bout des branches.",
+          "Cliquez sur une branche pour la replier ou la déplier et réviser bloc par bloc."],
+         "La carte est conservée avec le cours : vous la retrouvez à chaque visite.", "Ouvrir la mindmap"),
         ("plan", "📅", "Plan de révision", "Indiquez la date de l'examen : AKORI construit le plan jour par jour.",
          ["Saisissez la date, la portée (un cours, un module, tout) et le temps disponible par jour.",
           "Le plan mélange vos points faibles et une répétition espacée (1, 3, 7 puis 14 jours).",
@@ -2288,6 +2352,203 @@ def dashboard_html(active_doc=None):
       <div class='hf-sub'>Assistant Knowledge Organized to Revise Intelligently</div>
     </div>
     """
+
+HOME_SLOGAN = "Réviser, c'est reprendre, comprendre, mémoriser et maîtriser : chaque notion, avec les mots et les exemples de votre cours."
+EDITOR_NAME = os.getenv("AKORI_EDITOR", "Johana")
+APP_VERSION = "1.0"
+LAND_ICONS = {
+    "target": '<circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/>',
+    "layers": '<polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/>',
+    "cal": '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/>',
+    "chat": '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
+    "dice": '<rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="1"/><circle cx="15.5" cy="15.5" r="1"/><circle cx="12" cy="12" r="1"/>',
+    "check": '<polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>',
+    "mic": '<path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/>',
+    "mind": '<circle cx="5" cy="12" r="2.6"/><circle cx="19" cy="5" r="2.6"/><circle cx="19" cy="19" r="2.6"/><path d="M7.5 11l9-5M7.5 13l9 5"/>',
+    "folder": '<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>',
+    "book": '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20V2H6.5A2.5 2.5 0 0 0 4 4.5z"/><path d="M4 19.5V22h16"/>',
+    "trend": '<polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/>',
+    "clock": '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
+    "scan": '<path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2"/><line x1="7" y1="12" x2="17" y2="12"/>',
+}
+LANDING_TEMPLATE = r"""<div class='ld'>
+<header class='ld-nav'>
+  <div class='ld-brand'><img src='__LOGO__' alt='AKORI'><b>AKORI</b></div>
+  <nav class='ld-links'><a href='#ld-features'>Fonctionnalités</a><a href='#ld-how'>Comment ça marche</a><a href='#ld-engine'>Sous le capot</a><a href='#ld-faq'>FAQ</a></nav>
+  <button type='button' class='ld-btn ld-btn-ghost ld-login'>Se connecter</button>
+</header>
+
+<section class='ld-hero'>
+  <div class='ld-orb o1'></div><div class='ld-orb o2'></div><div class='ld-grid'></div>
+  <div class='ld-pill lr'><span class='ld-dot'></span> Nouveau · Plan de révision intelligent et Mindmap</div>
+  <h1 class='lr'>Révisez ce que dit<br><span class='ld-grad'>votre cours.</span> Rien d'autre.</h1>
+  <p class='ld-sub lr'>AKORI transforme vos PDF en un espace de révision complet : un assistant qui cite la page, des flashcards, des quiz, des colles orales, des cartes mentales et un plan jour par jour jusqu'à l'examen.</p>
+  <div class='ld-cta lr'>
+    <button type='button' class='ld-btn ld-btn-primary ld-login'>Commencer gratuitement <span>→</span></button>
+    <a class='ld-btn ld-btn-ghost' href='#ld-how'>Voir comment ça marche</a>
+  </div>
+  <div class='ld-trust lr'><span>Réponses fondées sur vos PDF</span><span>Pages citées</span><span>PDF scannés (OCR)</span><span>Français et English</span></div>
+
+  <div class='ld-mock lr'>
+    <div class='ld-win'>
+      <div class='ld-bar'><i></i><i></i><i></i><span>AKORI · Réseaux informatiques.pdf</span></div>
+      <div class='ld-body'>
+        <div class='ld-side'><b></b><b class='on'></b><b></b><b></b><b></b></div>
+        <div class='ld-chat'>
+          <div class='ld-msg me'>C'est quoi la différence entre TCP et UDP ?</div>
+          <div class='ld-msg ai'>TCP établit une connexion fiable (accusés de réception, retransmission) alors qu'UDP envoie sans garantie, mais plus vite [1].
+            <div class='ld-src'><span>p. 14 · Couche transport</span><span>p. 15</span></div></div>
+          <div class='ld-chips'><span>Épingler</span><span>Écouter</span><span>Sources (2)</span></div>
+        </div>
+        <div class='ld-cards'>
+          <div class='ld-mini'><em>Flashcards</em><b>7 cartes</b><div class='ld-roll'><i></i><i></i><i></i></div></div>
+          <div class='ld-mini'><em>Quiz</em><b>4 / 5</b><div class='ld-bar2'><i style='width:80%'></i></div></div>
+          <div class='ld-mini'><em>Plan de révision</em><b>J-9</b><div class='ld-bar2'><i style='width:42%'></i></div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class='ld-strip'><div class='ld-marquee'><div>
+  <span>Assistant avec sources</span><span>Flashcards roulette</span><span>Quiz instantané</span><span>Colle orale</span><span>Mindmap</span><span>Plan de révision</span><span>Résumé</span><span>Modules par semestre</span><span>OCR des scans</span><span>Historique et lacunes</span>
+  <span>Assistant avec sources</span><span>Flashcards roulette</span><span>Quiz instantané</span><span>Colle orale</span><span>Mindmap</span><span>Plan de révision</span><span>Résumé</span><span>Modules par semestre</span><span>OCR des scans</span><span>Historique et lacunes</span>
+</div></div></section>
+
+<section class='ld-sec'>
+  <div class='ld-head lr'><span class='ld-kicker'>Pourquoi AKORI</span><h2>Un assistant qui reste dans votre cours</h2><p>Les assistants généralistes inventent parfois. AKORI ne répond qu'avec ce qui figure dans vos supports, et vous montre d'où vient chaque réponse.</p></div>
+  <div class='ld-three'>
+    <div class='ld-card lr'><div class='ld-ico'>__I_target__</div><h3>Fidèle au support</h3><p>Chaque réponse est construite à partir des passages retrouvés dans votre PDF. Si l'information n'y est pas, AKORI le dit au lieu d'inventer.</p></div>
+    <div class='ld-card lr'><div class='ld-ico'>__I_layers__</div><h3>Mémorisation active</h3><p>Flashcards roulette, quiz corrigé au toucher, colle orale : vous retrouvez l'information au lieu de simplement la relire.</p></div>
+    <div class='ld-card lr'><div class='ld-ico'>__I_cal__</div><h3>Un plan qui s'adapte</h3><p>Donnez la date de l'examen : AKORI répartit les séances, rapproche vos points faibles et vous dit quelles pages relire.</p></div>
+  </div>
+</section>
+
+<section class='ld-sec' id='ld-features'>
+  <div class='ld-head lr'><span class='ld-kicker'>Fonctionnalités</span><h2>Tout ce qu'il faut pour réviser, au même endroit</h2></div>
+  <div class='ld-bento'>
+    <div class='ld-b big lr'><div class='ld-ico'>__I_chat__</div><h3>Assistant IA avec sources</h3><p>Posez vos questions en langage naturel. La réponse cite les pages utilisées, vous pouvez l'épingler dans « À revoir » ou l'écouter à voix haute. Cherchez dans un cours, un module entier ou tout votre espace.</p></div>
+    <div class='ld-b lr'><div class='ld-ico'>__I_dice__</div><h3>Flashcards roulette</h3><p>Au moins 7 cartes, un mode roulette qui rend la mémorisation vivante.</p></div>
+    <div class='ld-b lr'><div class='ld-ico'>__I_check__</div><h3>Quiz instantané</h3><p>Touchez une réponse : la correction apparaît aussitôt. Glissez pour passer à la suite.</p></div>
+    <div class='ld-b lr'><div class='ld-ico'>__I_mic__</div><h3>Colle orale</h3><p>Répondez à voix haute ou à l'écrit. Note sur 10 et page à relire.</p></div>
+    <div class='ld-b lr'><div class='ld-ico'>__I_mind__</div><h3>Mindmap</h3><p>Une carte mentale du cours, générée à partir de vos pages, à déplier branche par branche.</p></div>
+    <div class='ld-b big lr'><div class='ld-ico'>__I_cal__</div><h3>Plan de révision intelligent</h3><p>Date d'examen, temps disponible, portée du plan : AKORI combine vos points faibles et une répétition espacée (1, 3, 7 puis 14 jours), puis recalcule le plan après chaque séance.</p></div>
+    <div class='ld-b lr'><div class='ld-ico'>__I_folder__</div><h3>Modules et semestres</h3><p>Réunissez plusieurs cours (Systèmes, Réseaux, Algorithmique) et interrogez-les ensemble.</p></div>
+    <div class='ld-b lr'><div class='ld-ico'>__I_book__</div><h3>Résumé</h3><p>Les points clés du cours, dans votre langue.</p></div>
+    <div class='ld-b lr'><div class='ld-ico'>__I_trend__</div><h3>Progression claire</h3><p>Chaque pourcentage dit sur quoi il porte, cours par cours.</p></div>
+    <div class='ld-b lr'><div class='ld-ico'>__I_clock__</div><h3>Historique et lacunes</h3><p>AKORI cartographie vos notions fragiles et adapte le niveau de ses explications.</p></div>
+    <div class='ld-b lr'><div class='ld-ico'>__I_scan__</div><h3>PDF scannés (OCR)</h3><p>Même une photo de cours devient interrogeable.</p></div>
+  </div>
+</section>
+
+<section class='ld-sec' id='ld-how'>
+  <div class='ld-head lr'><span class='ld-kicker'>Comment ça marche</span><h2>De vos PDF à l'examen en trois temps</h2></div>
+  <div class='ld-steps'>
+    <div class='ld-step lr'><span>1</span><h3>Importez</h3><p>Déposez un ou plusieurs PDF, même scannés. AKORI lit, découpe et indexe chaque page, puis les range par module et par semestre.</p></div>
+    <div class='ld-step lr'><span>2</span><h3>Révisez</h3><p>Posez des questions, jouez les flashcards, passez un quiz, lancez une colle orale ou ouvrez la mindmap. Tout s'appuie sur votre cours.</p></div>
+    <div class='ld-step lr'><span>3</span><h3>Suivez</h3><p>Votre plan se recalcule, votre journal note chaque séance et la carte de vos lacunes montre quoi relire avant le jour J.</p></div>
+  </div>
+</section>
+
+<section class='ld-sec ld-split'>
+  <div class='ld-text lr'><span class='ld-kicker'>Plan de révision</span><h2>Chaque jour, quoi faire et quelles pages relire</h2>
+    <p>Fini les « je commence quand ? ». Le plan place d'abord ce qui est faible, espace ce qui est acquis et prévoit un jour de repos. Une mauvaise séance rapproche la prochaine ; une bonne la repousse.</p>
+    <ul><li>Pages à relire tirées de vos erreurs de quiz et de vos cartes « À revoir »</li><li>Répétition espacée à 1, 3, 7 puis 14 jours</li><li>Recalcul automatique après chaque séance</li></ul></div>
+  <div class='ld-demo lr'>
+    <div class='ld-day today'><b>Aujourd'hui</b><span>22 min</span><p>Quiz pour mesurer ta base</p><div class='ld-pg'><i>p. 12</i><i>p. 18 · Routage</i></div></div>
+    <div class='ld-day'><b>Demain</b><span>18 min</span><p>Flashcards à revoir</p></div>
+    <div class='ld-day'><b>Dimanche 25/10</b><span>24 min</span><p>Colle orale</p><div class='ld-pg'><i>p. 7</i></div></div>
+    <div class='ld-day rest'><b>Lundi 26/10</b><span>repos</span><p>La mémoire consolide</p></div>
+  </div>
+</section>
+
+<section class='ld-sec ld-split rev'>
+  <div class='ld-demo lr'>
+    <svg viewBox='0 0 460 250' class='ld-mm'>
+      <path d='M110 125C160 125 150 50 200 50' stroke='#4f6df5'/><path d='M110 125C160 125 150 125 200 125' stroke='#e86fb0'/><path d='M110 125C160 125 150 200 200 200' stroke='#10b981'/>
+      <path d='M290 50C320 50 320 25 350 25' stroke='#4f6df5'/><path d='M290 50C320 50 320 75 350 75' stroke='#4f6df5'/><path d='M290 125C320 125 320 125 350 125' stroke='#e86fb0'/><path d='M290 200C320 200 320 185 350 185' stroke='#10b981'/><path d='M290 200C320 200 320 220 350 220' stroke='#10b981'/>
+      <rect x='8' y='103' width='104' height='44' rx='22' fill='#4f6df5'/><text x='60' y='130' text-anchor='middle'>Réseaux</text>
+      <rect x='200' y='34' width='90' height='32' rx='16' fill='#4f6df5'/><text x='245' y='55' text-anchor='middle'>Modèle OSI</text>
+      <rect x='200' y='109' width='90' height='32' rx='16' fill='#e86fb0'/><text x='245' y='130' text-anchor='middle'>Transport</text>
+      <rect x='200' y='184' width='90' height='32' rx='16' fill='#10b981'/><text x='245' y='205' text-anchor='middle'>Routage</text>
+      <g class='leaf'><rect x='350' y='10' width='90' height='28' rx='14'/><text x='395' y='29' text-anchor='middle'>7 couches</text><rect x='350' y='60' width='90' height='28' rx='14'/><text x='395' y='79' text-anchor='middle'>Encapsul.</text>
+      <rect x='350' y='111' width='90' height='28' rx='14'/><text x='395' y='130' text-anchor='middle'>TCP / UDP</text><rect x='350' y='171' width='90' height='28' rx='14'/><text x='395' y='190' text-anchor='middle'>IP, RIP</text><rect x='350' y='206' width='90' height='28' rx='14'/><text x='395' y='225' text-anchor='middle'>OSPF</text></g>
+    </svg>
+  </div>
+  <div class='ld-text lr'><span class='ld-kicker'>Mindmap</span><h2>Voyez le cours d'un seul regard</h2>
+    <p>AKORI dessine la carte mentale de votre document : le thème au centre, les grandes notions autour, leurs détails au bout. Dépliez ou repliez chaque branche pour réviser par blocs.</p>
+    <ul><li>Générée uniquement à partir de vos pages</li><li>Branches colorées, repliables</li><li>Conservée avec le cours</li></ul></div>
+</section>
+
+<section class='ld-sec' id='ld-engine'>
+  <div class='ld-head lr'><span class='ld-kicker'>Sous le capot</span><h2>Une recherche sérieuse avant chaque réponse</h2><p>AKORI ne devine pas : il cherche d'abord dans votre cours, puis rédige.</p></div>
+  <div class='ld-flow lr'><span>PDF</span><i></i><span>OCR si besoin</span><i></i><span>Découpage par page</span><i></i><span>Embeddings BGE-M3</span><i></i><span>Index FAISS</span><i></i><span>Gemini</span><i></i><span class='end'>Réponse + pages</span></div>
+  <div class='ld-three'>
+    <div class='ld-card lr'><h3>Seuil de pertinence</h3><p>Si aucun passage n'est assez proche de la question, AKORI refuse de répondre plutôt que d'inventer.</p></div>
+    <div class='ld-card lr'><h3>Sources vérifiables</h3><p>Les passages et les pages utilisés sont affichés sous chaque réponse.</p></div>
+    <div class='ld-card lr'><h3>Vos données, à vous</h3><p>Chaque compte a son espace isolé. Vos documents ne sont visibles que de vous.</p></div>
+  </div>
+</section>
+
+<section class='ld-sec'>
+  <div class='ld-head lr'><span class='ld-kicker'>Pour qui</span><h2>Du collège aux études supérieures</h2></div>
+  <div class='ld-three'>
+    <div class='ld-card lr'><h3>Collège</h3><p>Des explications simples, pas à pas, avec des exemples tirés du cours.</p></div>
+    <div class='ld-card lr'><h3>Lycée</h3><p>Des quiz et des colles orales pour tenir le rythme jusqu'au bac.</p></div>
+    <div class='ld-card lr'><h3>Études supérieures</h3><p>Plusieurs unités d'enseignement dans un même espace, un plan par semestre.</p></div>
+  </div>
+</section>
+
+<section class='ld-sec' id='ld-faq'>
+  <div class='ld-head lr'><span class='ld-kicker'>Questions fréquentes</span><h2>Bon à savoir</h2></div>
+  <div class='ld-faq lr'>
+    <details><summary>Mes PDF sont-ils privés ?</summary><p>Oui. Chaque compte dispose de son propre espace, séparé des autres. Seuls la question et les passages retenus sont transmis au modèle pour rédiger la réponse.</p></details>
+    <details><summary>Et si la réponse n'est pas dans mon cours ?</summary><p>AKORI vous le dit clairement. Il ne complète pas avec des connaissances extérieures.</p></details>
+    <details><summary>Mes cours sont des scans ou des photos. Est-ce que ça marche ?</summary><p>Oui, une reconnaissance de texte (OCR) lit les pages qui sont des images.</p></details>
+    <details><summary>Puis-je interroger plusieurs cours à la fois ?</summary><p>Oui. Rangez vos cours dans des modules, puis choisissez « Mon module » ou « Tout mon espace » dans l'assistant.</p></details>
+    <details><summary>Faut-il payer ?</summary><p>La création de compte est gratuite.</p></details>
+  </div>
+</section>
+
+<section class='ld-final lr'>
+  <img src='__LOGO__' alt='AKORI'>
+  <h2>Prêt à réviser autrement ?</h2>
+  <p>Créez votre compte et importez votre premier cours en moins d'une minute.</p>
+  <button type='button' class='ld-btn ld-btn-primary ld-login'>Commencer maintenant <span>→</span></button>
+</section>
+
+<footer class='ld-foot'>
+  <p class='ld-slogan'>__SLOGAN__</p>
+  <div><b>AKORI</b> · Assistant Knowledge Organized to Revise Intelligently</div>
+  <small>Édité par __EDITOR__</small>
+</footer>
+</div>
+"""
+
+
+def landing_html():
+    """Page de présentation affichée avant la connexion."""
+    out = LANDING_TEMPLATE.replace("__LOGO__", LOGO_DATA_URI).replace("__SLOGAN__", HOME_SLOGAN).replace("__EDITOR__", _escape_html(EDITOR_NAME))
+    for name, body in LAND_ICONS.items():
+        out = out.replace(f"__I_{name}__", f'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">{body}</svg>')
+    return out
+
+
+def about_html():
+    return f"""
+    <div class='about-card'>
+      <div class='about-head'><img src='{LOGO_DATA_URI}' alt='AKORI'><div><b>AKORI</b><span>Assistant Knowledge Organized to Revise Intelligently · version {APP_VERSION}</span></div></div>
+      <p>AKORI est un assistant de révision qui part de vos propres cours. Vous importez vos PDF, même scannés ; AKORI les lit, les indexe page par page, puis vous aide à réviser : assistant qui cite ses sources, flashcards, quiz, colle orale, mindmap, résumé et plan de révision jusqu'à l'examen.</p>
+      <div class='about-chips'><span>Recherche FAISS</span><span>Embeddings BGE-M3</span><span>Gemini</span><span>OCR</span><span>Gradio</span></div>
+      <p class='about-note'>Principe : réviser, c'est reprendre, comprendre, mémoriser et maîtriser. AKORI ne répond qu'avec le contenu de votre support, et indique la page à relire.</p>
+    </div>
+    <div class='about-card about-editor'>
+      <div class='about-av'>{_escape_html(EDITOR_NAME[:1].upper() or 'A')}</div>
+      <div><b>{_escape_html(EDITOR_NAME)}</b><span>Éditeur et développeur d'AKORI</span>
+      <p>AKORI est né d'un constat simple : on révise mieux quand l'outil parle comme le cours. Il est conçu, développé et amélioré en continu par {_escape_html(EDITOR_NAME)}, avec l'aide de ses utilisateurs.</p></div>
+    </div>
+    """
+
 
 def course_overview_html(active_doc=None):
     if not active_doc or active_doc not in documents_db:
@@ -2656,7 +2917,7 @@ def plan_open():
 
 # ---------------- journal de révision
 SESSION_LABEL = {"quiz": ("🎯", "Quiz"), "flash": ("🎰", "Flashcards"), "oral": ("🎤", "Colle orale"), "chat": ("✦", "Assistant"),
-                 "summary": ("📚", "Résumé")}
+                 "summary": ("📚", "Résumé"), "mindmap": ("🕸", "Mindmap")}
 
 
 def _streak(days_set, today):
@@ -2735,6 +2996,153 @@ def journal_html():
 def after_session_refresh():
     """Après chaque séance : le plan et le journal se recalculent."""
     return plan_html(), journal_html()
+
+
+# ============================================================
+# MINDMAP — carte mentale du cours (repliable), générée à partir des pages
+# ============================================================
+MM_COLORS = ["#4f6df5", "#e86fb0", "#10b981", "#f59e0b", "#8e6cf4", "#06b6d4", "#ef4444"]
+_MM_STOP = set("dans pour avec cette comme plus sont être avoir leur leurs elles nous vous aussi donc mais ainsi chaque entre sans sous tout tous toute toutes "
+               "celui celle fait peut peuvent cours exemple partie premier première deuxième lorsque alors comment pourquoi quand dont ceux celles ces ses mes".split())
+
+
+def _mm_trim(text, n):
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= n else text[:n - 1].rstrip() + "…"
+
+
+def _mm_clean(data):
+    """JSON de Gemini -> {"title", "branches": [{"label", "children": [...]}]} borné et propre, ou None."""
+    if not isinstance(data, dict):
+        return None
+    branches = []
+    for b in (data.get("branches") or data.get("children") or [])[:7]:
+        if isinstance(b, dict):
+            label = _mm_trim(b.get("label") or b.get("title") or b.get("name"), 38)
+            kids = [_mm_trim(c if isinstance(c, str) else (c.get("label") or c.get("title") or "") if isinstance(c, dict) else "", 40) for c in (b.get("children") or [])[:5]]
+        elif isinstance(b, str):
+            label, kids = _mm_trim(b, 38), []
+        else:
+            continue
+        kids = [k for k in kids if k]
+        if label:
+            branches.append({"label": label, "children": kids})
+    if len(branches) < 2:
+        return None
+    return {"title": _mm_trim(data.get("title") or data.get("root") or "Cours", 40), "branches": branches}
+
+
+def _mindmap_offline(doc_name):
+    """Carte de secours sans IA : sections du document et mots les plus fréquents de chacune."""
+    doc = documents_db[doc_name]
+    groups = {}
+    for d in doc["vector_db"].docstore._dict.values():
+        meta = d.metadata or {}
+        key = (meta.get("section") or "").strip() or f"Page {int(meta.get('page', 1) or 1)}"
+        groups.setdefault(key, []).append(d.page_content)
+    ranked = sorted(groups.items(), key=lambda kv: -sum(len(t) for t in kv[1]))[:6]
+    branches = []
+    for label, texts in ranked:
+        freq = {}
+        for w in re.findall(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'\-]{5,}", " ".join(texts)):
+            lw = w.lower()
+            if lw not in _MM_STOP:
+                freq[lw] = freq.get(lw, 0) + 1
+        kids = [w.capitalize() for w, _ in sorted(freq.items(), key=lambda kv: -kv[1])[:3]]
+        branches.append({"label": _mm_trim(label, 38), "children": kids})
+    return {"title": _mm_trim(doc.get("title") or os.path.splitext(doc_name)[0], 40), "branches": branches}
+
+
+def _mm_w(text, base=26, per=7.4):
+    return int(len(text) * per + base)
+
+
+def mindmap_html(data):
+    if not data or not data.get("branches"):
+        return ("<div class='empty-study'>🕸<br><b>Aucune mindmap pour ce cours.</b><br>Cliquez sur « Générer la mindmap » : AKORI dessine la carte mentale du cours actif.</div>")
+    branches = data["branches"]
+    X0, ROW = 14, 40
+    data = dict(data, title=_mm_trim(data["title"], 24))
+    rw = max(150, min(250, _mm_w(data["title"], 40)))
+    bw = max(120, min(240, max(_mm_w(b["label"]) for b in branches)))
+    bx, lx = X0 + rw + 70, X0 + rw + 70 + bw + 60
+    leaf_w = [[max(100, min(270, _mm_w(c))) for c in b["children"]] for b in branches]
+    max_leaf = max([w for ws in leaf_w for w in ws] or [100])
+    W = lx + max_leaf + 16
+    y, by_list, leaf_y = 22, [], []
+    for b in branches:
+        ys = []
+        for _ in (b["children"] or [None]):
+            ys.append(y + ROW / 2)
+            y += ROW
+        leaf_y.append(ys)
+        by_list.append(sum(ys) / len(ys))
+        y += 14
+    H = y + 4
+    ry = sum(by_list) / len(by_list)
+    out = [f"<svg class='mm-svg' viewBox='0 0 {W} {H}' style='min-width:{min(W, 760)}px' xmlns='http://www.w3.org/2000/svg'>"]
+    out.append(f"<defs><linearGradient id='mmroot' x1='0' x2='1'><stop offset='0' stop-color='#4f6df5'/><stop offset='1' stop-color='#8e6cf4'/></linearGradient></defs>")
+    for i, b in enumerate(branches):
+        c = MM_COLORS[i % len(MM_COLORS)]
+        by = by_list[i]
+        out.append(f"<path class='mm-path' style='--i:{i}' d='M{X0 + rw} {ry:.1f} C{X0 + rw + 40} {ry:.1f} {bx - 40} {by:.1f} {bx} {by:.1f}' stroke='{c}' fill='none' stroke-width='3'/>")
+    out.append(f"<g class='mm-root'><rect x='{X0}' y='{ry - 25:.1f}' width='{rw}' height='50' rx='25' fill='url(#mmroot)'/>"
+               f"<text x='{X0 + rw / 2}' y='{ry + 5:.1f}' text-anchor='middle' class='mm-t-root'>{_escape_html(data['title'])}<title>{_escape_html(data['title'])}</title></text></g>")
+    for i, b in enumerate(branches):
+        c = MM_COLORS[i % len(MM_COLORS)]
+        by = by_list[i]
+        g = [f"<g class='mm-br' style='--i:{i}'>"]
+        for k, kid in enumerate(b["children"]):
+            ky, kw = leaf_y[i][k], leaf_w[i][k]
+            g.append(f"<path class='mm-lp' d='M{bx + bw} {by:.1f} C{bx + bw + 30} {by:.1f} {lx - 30} {ky:.1f} {lx} {ky:.1f}' stroke='{c}' fill='none' stroke-width='2' opacity='.65'/>")
+            g.append(f"<g class='mm-leaf'><rect x='{lx}' y='{ky - 15:.1f}' width='{kw}' height='30' rx='15' fill='{c}' fill-opacity='.12' stroke='{c}' stroke-opacity='.55'/>"
+                     f"<text x='{lx + kw / 2}' y='{ky + 4.5:.1f}' text-anchor='middle' class='mm-t-leaf'>{_escape_html(kid)}<title>{_escape_html(kid)}</title></text></g>")
+        g.append(f"<g class='mm-bnode'><rect x='{bx}' y='{by - 19:.1f}' width='{bw}' height='38' rx='19' fill='{c}'/>"
+                 f"<text x='{bx + bw / 2}' y='{by + 5:.1f}' text-anchor='middle' class='mm-t-br'>{_escape_html(b['label'])}<title>{_escape_html(b['label'])}</title></text>")
+        if b["children"]:
+            g.append(f"<circle cx='{bx + bw}' cy='{by:.1f}' r='9' fill='#fff' stroke='{c}' stroke-width='2'/>"
+                     f"<text x='{bx + bw}' y='{by + 4:.1f}' text-anchor='middle' class='mm-minus' fill='{c}'>−</text><text x='{bx + bw}' y='{by + 4:.1f}' text-anchor='middle' class='mm-plus' fill='{c}'>+</text>")
+        g.append("</g></g>")
+        out.append("".join(g))
+    out.append("</svg>")
+    return "<div class='mm-wrap'><div class='mm-hint'>Cliquez sur une branche pour la replier ou la déplier.</div><div class='mm-scroll'>" + "".join(out) + "</div></div>"
+
+
+def mindmap_view(doc_name=None, lang=None):
+    cached = ((documents_db.get(doc_name) or {}).get("mindmap_cache") or {}).get(_lang_code(lang)) if doc_name else None
+    return mindmap_html(cached), ""
+
+
+def mindmap_generate_handler(doc_name, lang=None):
+    if not doc_name or doc_name not in documents_db:
+        yield mindmap_html(None), "⚠️ Sélectionnez d'abord un cours."
+        return
+    entry = documents_db[doc_name]
+    context = "\n\n".join(preparer_contexte_global(entry))[:24000]
+    prompt = f"""CONTEXTE DU COURS:\n{context}\n\n
+Construis la carte mentale de ce cours : un titre central, 5 à 7 grandes notions (branches) et 2 à 4 sous-notions par branche.
+Libellés courts (6 mots maximum), fidèles au vocabulaire du cours. N'invente rien.
+Retourne UNIQUEMENT un JSON valide : {{"title": "...", "branches": [{{"label": "...", "children": ["...", "..."]}}]}}"""
+    note = ""
+
+    def work():
+        raw = _gemini_structured(prompt, _with_lang("Tu es AKORI, assistant académique. Base-toi uniquement sur le contexte fourni.", lang), max_tokens=1800)
+        return _mm_clean(_extract_json_from_text(raw))
+
+    data = None
+    try:
+        data = yield from _with_heartbeat(work, lambda sec: (gr.update(), f"⏳ Construction de la mindmap… ({sec} s)"))
+    except Exception as e:
+        _log("error", detail=f"mindmap · {e}")
+        note = f" (IA indisponible : carte simplifiée à partir des sections — {str(e)[:80]})"
+    if not data:
+        data = _mindmap_offline(doc_name)
+        note = note or " (carte simplifiée à partir des sections du document)"
+    entry.setdefault("mindmap_cache", {})[_lang_code(lang)] = data
+    _save_history(doc_name)
+    _session("mindmap", doc_name)
+    _log("mindmap", detail=doc_name)
+    yield mindmap_html(data), "✅ Mindmap prête." + note
 
 
 # ============================================================
@@ -3269,14 +3677,8 @@ def _quiz_score(questions, answers):
 
 
 def _quiz_radio(questions, index, visible=True):
-    """Radio dont les choix sont les vrais textes des réponses."""
-    if not questions or index >= len(questions):
-        return gr.update(choices=[], value=None, visible=False)
-    options = questions[index]["options"]
-    return gr.update(
-        choices=[(f"{chr(65 + i)}.  {opt}", i) for i, opt in enumerate(options)],
-        value=None, visible=visible, interactive=True, label="Choisissez votre réponse",
-    )
+    """Le choix se fait en touchant la réponse dans la carte : le Radio d'origine reste caché."""
+    return gr.update(choices=[], value=None, visible=False)
 
 
 def quiz_view(questions, index=0, validated=False, answers=None):
@@ -3304,7 +3706,15 @@ def quiz_view(questions, index=0, validated=False, answers=None):
             rows += f"<div class='{cls}'><span>{mark}</span>{_escape_html(option)}</div>"
         ok = selected is not None and int(selected) == int(q["answer"])
         verdict = "<div class='quiz-verdict ok'>✅ Bonne réponse !</div>" if ok else "<div class='quiz-verdict ko'>❌ Réponse incorrecte</div>"
-        body = f"{verdict}{rows}<div class='quiz-explanation'><b>Explication :</b> {_escape_html(q.get('explanation', ''))}</div>"
+        last = index == total - 1
+        swipe = (f"<div class='quiz-swipe'><span class='qs-arrow'>←</span><span>Glissez vers la gauche pour "
+                 f"{'voir le résultat' if last else 'passer à la question suivante'}</span>"
+                 f"<button type='button' class='ak-act ak-quiz-next'><span>{'Résultat' if last else 'Suivant'}</span> →</button></div>")
+        body = f"{verdict}<div class='quiz-options'>{rows}</div><div class='quiz-explanation'><b>Explication :</b> {_escape_html(q.get('explanation', ''))}</div>{swipe}"
+    else:
+        rows = "".join(f"<button type='button' class='option opt-click ak-o-{i}'><span>{chr(65 + i)}</span>{_escape_html(option)}</button>"
+                       for i, option in enumerate(q["options"]))
+        body = f"<div class='quiz-options'>{rows}</div><div class='quiz-tap'>Touchez une réponse : la correction s'affiche aussitôt.</div>"
 
     return f"""
     <div class='quiz-topline'><span>Question {index + 1} / {total}</span><span>Score : {score}</span></div>
@@ -3349,8 +3759,8 @@ def quiz_validate_handler(questions, index, choice, validated, answers, doc_name
         return validated, gr.update(), "⚠️ Générez d'abord un quiz.", answers, gr.update(), gr.update()
     if validated:
         return validated, gr.update(), "ℹ️ Réponse déjà validée : passez à la suite.", answers, gr.update(), gr.update()
-    if choice is None:
-        return False, gr.update(), "⚠️ Sélectionnez une réponse avant de valider.", answers, gr.update(), gr.update()
+    if choice is None or choice == "":
+        return False, gr.update(), "⚠️ Touchez une réponse.", answers, gr.update(), gr.update()
     idx = int(index)
     answers = list(answers or [None] * len(questions))
     answers.extend([None] * (len(questions) - len(answers)))
@@ -4322,7 +4732,7 @@ html { overflow-y:scroll!important; }
 #sidebar .block { padding:0!important;margin:0!important;border:0!important;min-height:0!important;flex:none!important; }
 #sidebar .navbtn {
   display:flex!important;align-items:center!important;justify-content:flex-start!important;gap:12px!important;
-  width:100%!important;min-height:clamp(24px, calc((100vh - 345px) / 15), 40px)!important;margin:0!important;padding:0 12px!important;
+  width:100%!important;min-height:clamp(24px, calc((100vh - 345px) / 16), 40px)!important;margin:0!important;padding:0 12px!important;
   font-size:13px!important;white-space:nowrap!important;overflow:hidden!important;text-overflow:clip!important;flex:none!important;
   transition:background-color .18s ease, color .18s ease, border-color .18s ease, transform .18s ease!important;
 }
@@ -4629,6 +5039,149 @@ html:root:root:root:root body #sidebar .navbtn.nav-active::after {
 }
 html:root:root:root:root body.akori-dark #sidebar .navbtn.nav-active { background:var(--ak-soft)!important; }
 
+#sidebar #nav-mindmap::before { content:""!important;width:20px!important;height:20px!important;font-size:0!important;background:currentColor!important;-webkit-mask:url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%20fill='none'%20stroke='black'%20stroke-width='1.9'%20stroke-linecap='round'%20stroke-linejoin='round'%3E%3Ccircle%20cx='5'%20cy='12'%20r='2.6'/%3E%3Ccircle%20cx='19'%20cy='5'%20r='2.6'/%3E%3Ccircle%20cx='19'%20cy='19'%20r='2.6'/%3E%3Cpath%20d='M7.5%2011l9-5M7.5%2013l9%205'/%3E%3C/svg%3E") center/contain no-repeat!important;mask:url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%20fill='none'%20stroke='black'%20stroke-width='1.9'%20stroke-linecap='round'%20stroke-linejoin='round'%3E%3Ccircle%20cx='5'%20cy='12'%20r='2.6'/%3E%3Ccircle%20cx='19'%20cy='5'%20r='2.6'/%3E%3Ccircle%20cx='19'%20cy='19'%20r='2.6'/%3E%3Cpath%20d='M7.5%2011l9-5M7.5%2013l9%205'/%3E%3C/svg%3E") center/contain no-repeat!important; }
+
+/* ===== menu replié : seule l'icône reste visible ===== */
+html:root:root:root:root body.sidebar-collapsed:not(.sb-hover) #sidebar .navbtn.nav-active {
+  width:100%!important;margin-right:0!important;overflow:hidden!important;border-radius:12px!important;box-shadow:none!important;animation:none!important;
+}
+html:root:root:root:root body.sidebar-collapsed:not(.sb-hover) #sidebar .navbtn.nav-active::after { display:none!important; }
+@media (max-width:900px) {
+  html:root:root:root:root body:not(.sb-hover) #sidebar .navbtn.nav-active { width:100%!important;margin-right:0!important;overflow:hidden!important;border-radius:12px!important;box-shadow:none!important; }
+  html:root:root:root:root body:not(.sb-hover) #sidebar .navbtn.nav-active::after { display:none!important; }
+}
+
+/* ===== quiz : toucher = correction, glisser = suite ===== */
+.quiz-card { touch-action:pan-y;transition:transform .2s ease,opacity .2s ease;animation:akrise .35s ease both; }
+.quiz-card.swipe-out { transform:translateX(-60px);opacity:0; }
+.quiz-options { display:flex;flex-direction:column; }
+button.option.opt-click { width:100%;text-align:left;font:inherit;background:var(--ak-card);transition:transform .15s ease,border-color .15s ease,background .15s ease,box-shadow .15s ease; }
+button.option.opt-click:hover { border-color:var(--ak-blue);background:var(--ak-soft);transform:translateX(4px);box-shadow:0 6px 16px rgba(79,109,245,.12); }
+button.option.opt-click:active { transform:scale(.99); }
+.option.correct,.option.wrong { animation:akrise .35s ease both; }
+.quiz-tap { margin-top:10px;color:var(--ak-muted);font-size:12.5px;text-align:center; }
+.quiz-swipe { display:flex;align-items:center;gap:10px;margin-top:14px;padding:10px 14px;border-radius:12px;background:var(--ak-soft);color:var(--ak-text);font-size:13px; }
+.quiz-swipe .qs-arrow { font-size:20px;color:var(--ak-blue);animation:qsnudge 1.2s ease-in-out infinite; }
+@keyframes qsnudge { 0%,100% { transform:translateX(0); } 50% { transform:translateX(-7px); } }
+.quiz-swipe .ak-quiz-next { margin-left:auto; }
+
+/* ===== mindmap ===== */
+.mm-wrap { border:1px solid var(--ak-line);border-radius:18px;background:var(--ak-card);padding:14px 16px;animation:akrise .5s ease both; }
+.mm-hint { color:var(--ak-muted);font-size:12.5px;margin-bottom:8px; }
+.mm-scroll { overflow-x:auto; }
+.mm-svg { width:100%;height:auto;display:block; }
+.mm-svg text { font-family:inherit;font-size:13px;pointer-events:none; }
+.mm-t-root { fill:#fff;font-weight:800;font-size:15px!important; } .mm-t-br { fill:#fff;font-weight:700; } .mm-t-leaf { fill:var(--ak-text);font-weight:600;font-size:12.5px!important; }
+.mm-path,.mm-lp { stroke-dasharray:600;stroke-dashoffset:600;animation:mmdraw 1s ease forwards;animation-delay:calc(var(--i,0) * 120ms + 150ms); }
+.mm-lp { animation-delay:.6s; }
+@keyframes mmdraw { to { stroke-dashoffset:0; } }
+.mm-root { animation:mmpop .6s cubic-bezier(.2,.9,.3,1.3) both; transform-box:fill-box;transform-origin:center; }
+.mm-br { animation:mmpop .6s cubic-bezier(.2,.9,.3,1.3) both;animation-delay:calc(var(--i,0) * 120ms + 300ms);transform-box:fill-box;transform-origin:left center; }
+@keyframes mmpop { from { opacity:0;transform:scale(.7); } to { opacity:1;transform:scale(1); } }
+.mm-bnode { cursor:pointer; } .mm-bnode:hover rect:first-child { filter:brightness(1.08); }
+.mm-leaf { transition:transform .2s ease; } .mm-leaf:hover { transform:translateX(3px); }
+.mm-plus { display:none; } .mm-br.mm-closed .mm-plus { display:block; } .mm-br.mm-closed .mm-minus { display:none; }
+.mm-br.mm-closed .mm-leaf,.mm-br.mm-closed .mm-lp { display:none; }
+
+/* ===== à propos ===== */
+.about-card { border:1px solid var(--ak-line);border-radius:18px;background:var(--ak-card);padding:20px 22px;margin:10px 0;animation:akrise .5s ease both; }
+.about-card p { color:var(--ak-text);line-height:1.6;margin:10px 0 0; } .about-note { color:var(--ak-muted)!important;font-size:13px; }
+.about-head { display:flex;align-items:center;gap:14px; } .about-head img { width:56px;height:56px;border-radius:16px;box-shadow:0 8px 20px rgba(79,109,245,.25); }
+.about-head b,.about-editor b { display:block;font-size:19px;color:var(--ak-text); } .about-head span,.about-editor span { color:var(--ak-muted);font-size:12.5px; }
+.about-chips { display:flex;flex-wrap:wrap;gap:8px;margin-top:12px; } .about-chips span { padding:4px 12px;border-radius:99px;background:var(--ak-soft);color:var(--ak-blue-dark);font-size:12.5px;font-weight:700; }
+.about-editor { display:flex;gap:16px;align-items:flex-start; }
+.about-av { flex:none;width:56px;height:56px;border-radius:50%;background:linear-gradient(135deg,#4f6df5,#8e6cf4);color:#fff;font-size:24px;font-weight:800;display:flex;align-items:center;justify-content:center; }
+
+/* ===== page de présentation (avant connexion) ===== */
+html:root:root:root:root body #login-view:has(#landing) { width:100%!important;max-width:none!important;padding:0!important;margin:0!important;gap:0!important; }
+#landing { width:100%!important;max-width:none!important;padding:0!important;gap:0!important;background:transparent!important;border:0!important; }
+#landing .block,#landing .html-container,#landing .prose { padding:0!important;max-width:none!important;background:transparent!important;border:0!important;box-shadow:none!important; }
+#login-wrap { width:min(560px,100%)!important;margin:0 auto!important;gap:14px!important; }
+#back-land { align-self:flex-start!important; }
+#landing .ld { --lb:#4f6df5;--lp:#8e6cf4;color:#d9dbe6;overflow-x:clip;text-align:left; }
+#landing .ld h1,#landing .ld h2,#landing .ld h3,#landing .ld p { margin:0; }
+#landing .ld a { text-decoration:none; }
+.lr { opacity:0;transform:translateY(28px);transition:opacity .8s ease,transform .8s cubic-bezier(.2,.8,.2,1);animation:ldshow .01s 3.2s forwards; }
+.lr.in { opacity:1;transform:none; }
+@keyframes ldshow { to { opacity:1;transform:none; } }
+.ld-nav { position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:20px;padding:14px max(20px,calc((100% - 1120px)/2));background:rgba(10,10,12,.72);backdrop-filter:blur(14px);border-bottom:1px solid rgba(255,255,255,.07); }
+.ld-brand { display:flex;align-items:center;gap:10px;margin-right:auto; } .ld-brand img { width:34px;height:34px;border-radius:10px; } .ld-brand b { font-size:19px;letter-spacing:.12em;color:#fff; }
+.ld-links { display:flex;gap:22px; } .ld-links a { color:#9a9fb5;font-size:14px;font-weight:600;transition:color .2s; } .ld-links a:hover { color:#fff; }
+.ld-btn { display:inline-flex;align-items:center;gap:8px;padding:11px 20px;border-radius:12px;font:inherit;font-weight:700;font-size:14.5px;cursor:pointer;border:1px solid transparent;transition:transform .2s ease,box-shadow .2s ease,background .2s ease; }
+.ld-btn:hover { transform:translateY(-2px); }
+.ld-btn-primary { background:linear-gradient(135deg,#4f6df5,#8e6cf4);color:#fff!important;box-shadow:0 10px 30px rgba(99,102,241,.4); } .ld-btn-primary:hover { box-shadow:0 14px 38px rgba(99,102,241,.55); } .ld-btn-primary span { transition:transform .2s; } .ld-btn-primary:hover span { transform:translateX(4px); }
+.ld-btn-ghost { background:rgba(255,255,255,.06);border-color:rgba(255,255,255,.14);color:#e8e9f1!important; } .ld-btn-ghost:hover { background:rgba(255,255,255,.12); }
+.ld-hero { position:relative;text-align:center;padding:84px 20px 40px;max-width:1120px;margin:0 auto; }
+.ld-orb { position:absolute;border-radius:50%;filter:blur(70px);pointer-events:none;z-index:0; }
+.ld-orb.o1 { width:420px;height:420px;left:-80px;top:-40px;background:rgba(79,109,245,.35);animation:akblob 11s ease-in-out infinite; }
+.ld-orb.o2 { width:380px;height:380px;right:-60px;top:60px;background:rgba(232,111,176,.24);animation:akblob 13s ease-in-out infinite reverse; }
+.ld-grid { position:absolute;inset:0;z-index:0;background-image:linear-gradient(rgba(255,255,255,.04) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.04) 1px,transparent 1px);background-size:44px 44px;-webkit-mask:radial-gradient(ellipse at 50% 30%,#000 20%,transparent 70%);mask:radial-gradient(ellipse at 50% 30%,#000 20%,transparent 70%); }
+.ld-hero > * { position:relative;z-index:1; } .ld-hero > .ld-orb,.ld-hero > .ld-grid { position:absolute; }
+.ld-pill { display:inline-flex;align-items:center;gap:9px;padding:7px 16px;border-radius:99px;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.14);font-size:13px;font-weight:600;color:#cfd3ea; }
+.ld-dot { width:8px;height:8px;border-radius:50%;background:#4ade80;box-shadow:0 0 0 0 rgba(74,222,128,.7);animation:ldping 1.8s infinite; } @keyframes ldping { 70% { box-shadow:0 0 0 9px rgba(74,222,128,0); } 100% { box-shadow:0 0 0 0 rgba(74,222,128,0); } }
+.ld-hero h1 { margin:22px auto 0!important;font-size:clamp(34px,6vw,68px);line-height:1.05;font-weight:850;letter-spacing:-.02em;color:#fff!important;max-width:900px; }
+.ld-grad { background:linear-gradient(90deg,#6c8bff,#b58bff,#ff7ac3,#6c8bff);background-size:200% 100%;-webkit-background-clip:text;background-clip:text;color:transparent;-webkit-text-fill-color:transparent;animation:akflow 6s linear infinite; }
+.ld-sub { max-width:680px;margin:22px auto 0!important;font-size:clamp(15px,2vw,18.5px);line-height:1.6;color:#a6abc2!important; }
+.ld-cta { display:flex;gap:12px;justify-content:center;flex-wrap:wrap;margin-top:30px; }
+.ld-trust { display:flex;flex-wrap:wrap;justify-content:center;gap:10px 22px;margin-top:26px;color:#8a8fa8;font-size:13px; } .ld-trust span::before { content:"✓";color:#4ade80;margin-right:7px;font-weight:800; }
+.ld-mock { margin:46px auto 0;max-width:900px;perspective:1200px; }
+.ld-win { border-radius:18px;background:#14151c;border:1px solid rgba(255,255,255,.1);box-shadow:0 40px 90px rgba(0,0,0,.6),0 0 0 1px rgba(255,255,255,.03),0 0 80px rgba(99,102,241,.2);transform:rotateX(6deg);transform-origin:50% 100%;animation:ldfloat 7s ease-in-out infinite;overflow:hidden; }
+@keyframes ldfloat { 0%,100% { transform:rotateX(6deg) translateY(0); } 50% { transform:rotateX(4deg) translateY(-10px); } }
+.ld-bar { display:flex;align-items:center;gap:7px;padding:12px 16px;border-bottom:1px solid rgba(255,255,255,.07); } .ld-bar i { width:11px;height:11px;border-radius:50%;background:#3a3c4a; } .ld-bar i:first-child { background:#ff5f57; } .ld-bar i:nth-child(2) { background:#febc2e; } .ld-bar i:nth-child(3) { background:#28c840; } .ld-bar span { margin-left:10px;color:#7d8199;font-size:12.5px; }
+.ld-body { display:grid;grid-template-columns:54px 1.5fr 1fr;gap:16px;padding:16px;text-align:left; }
+.ld-side { display:flex;flex-direction:column;gap:12px;align-items:center;padding-top:6px; } .ld-side b { width:26px;height:26px;border-radius:8px;background:#23252f; } .ld-side b.on { background:linear-gradient(135deg,#4f6df5,#8e6cf4); }
+.ld-chat { display:flex;flex-direction:column;gap:10px; } .ld-msg { padding:11px 14px;border-radius:14px;font-size:13.5px;line-height:1.5;max-width:92%; }
+.ld-msg.me { align-self:flex-end;background:linear-gradient(135deg,#4f6df5,#7a62f0);color:#fff; } .ld-msg.ai { background:#1d1f29;border:1px solid rgba(255,255,255,.08);color:#d9dbe6; }
+.ld-src { display:flex;gap:6px;margin-top:8px; } .ld-src span { font-size:11.5px;padding:3px 9px;border-radius:99px;background:rgba(99,102,241,.2);color:#aab6ff; }
+.ld-chips { display:flex;gap:8px; } .ld-chips span { font-size:11.5px;padding:4px 11px;border-radius:99px;border:1px solid rgba(255,255,255,.12);color:#9a9fb5; }
+.ld-cards { display:flex;flex-direction:column;gap:10px; } .ld-mini { padding:12px 14px;border-radius:14px;background:#1d1f29;border:1px solid rgba(255,255,255,.08); } .ld-mini em { display:block;font-style:normal;font-size:11.5px;color:#8a8fa8; } .ld-mini b { display:block;font-size:20px;color:#fff;margin:2px 0 7px; }
+.ld-bar2 { height:6px;border-radius:99px;background:#2a2c38;overflow:hidden; } .ld-bar2 i { display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,#4f6df5,#ff7ac3);animation:akgrow 1.4s ease both; }
+.ld-roll { display:flex;gap:6px; } .ld-roll i { width:24px;height:30px;border-radius:6px;background:#2a2c38;animation:ldroll 1.6s ease-in-out infinite; } .ld-roll i:nth-child(2) { animation-delay:.2s;background:#4f6df5; } .ld-roll i:nth-child(3) { animation-delay:.4s; }
+@keyframes ldroll { 0%,100% { transform:translateY(0); } 50% { transform:translateY(-6px); } }
+.ld-strip { margin:50px 0 0;border-block:1px solid rgba(255,255,255,.07);padding:16px 0;overflow:hidden;background:rgba(255,255,255,.02); }
+.ld-marquee { display:flex;width:max-content;animation:ldmarq 38s linear infinite; } .ld-marquee > div { display:flex;gap:44px;padding-right:44px; } .ld-marquee span { color:#8a8fa8;font-weight:700;font-size:14px;white-space:nowrap; } .ld-marquee span::before { content:"✦";color:#6c8bff;margin-right:14px; }
+@keyframes ldmarq { to { transform:translateX(-50%); } }
+.ld-sec { max-width:1120px;margin:0 auto;padding:96px 20px 0; }
+.ld-head { text-align:center;max-width:720px;margin:0 auto 44px; } .ld-kicker { display:inline-block;font-size:12px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;color:#8ea2ff;margin-bottom:12px; }
+.ld-head h2,.ld-text h2 { font-size:clamp(26px,4vw,42px);line-height:1.15;font-weight:850;letter-spacing:-.01em;color:#fff!important; } .ld-head p { margin-top:14px!important;color:#9a9fb5!important;font-size:16.5px;line-height:1.6; }
+.ld-three { display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:18px; }
+.ld-card,.ld-b { padding:26px;border-radius:20px;background:linear-gradient(160deg,rgba(255,255,255,.07),rgba(255,255,255,.02));border:1px solid rgba(255,255,255,.09);transition:transform .25s ease,border-color .25s ease,box-shadow .25s ease; }
+.ld-card:hover,.ld-b:hover { transform:translateY(-6px);border-color:rgba(142,162,255,.5);box-shadow:0 20px 50px rgba(79,109,245,.18); }
+.ld-card h3,.ld-b h3 { font-size:18px;font-weight:800;color:#fff!important;margin:14px 0 8px!important; } .ld-card p,.ld-b p { color:#9a9fb5!important;line-height:1.6;font-size:14.5px; }
+.ld-ico { width:46px;height:46px;border-radius:14px;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,rgba(79,109,245,.3),rgba(142,108,244,.3));color:#b4c0ff;border:1px solid rgba(142,162,255,.3); } .ld-ico svg { width:23px;height:23px; }
+.ld-b:hover .ld-ico { transform:rotate(-8deg) scale(1.1); } .ld-ico { transition:transform .25s ease; }
+.ld-bento { display:grid;grid-template-columns:repeat(4,1fr);gap:16px; } .ld-b.big { grid-column:span 2; }
+.ld-steps { display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:18px;counter-reset:s; }
+.ld-step { position:relative;padding:28px 26px;border-radius:20px;border:1px solid rgba(255,255,255,.09);background:rgba(255,255,255,.03); } .ld-step span { width:42px;height:42px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:850;color:#fff;background:linear-gradient(135deg,#4f6df5,#ff7ac3);box-shadow:0 8px 24px rgba(99,102,241,.4); }
+.ld-step h3 { margin:16px 0 8px!important;font-size:20px;font-weight:800;color:#fff!important; } .ld-step p { color:#9a9fb5!important;line-height:1.6;font-size:14.5px; }
+.ld-split { display:grid;grid-template-columns:1fr 1fr;gap:48px;align-items:center; } .ld-split.rev .ld-demo { order:-1; }
+.ld-text p { margin-top:16px!important;color:#9a9fb5!important;line-height:1.7;font-size:16px; } .ld-text ul { margin:18px 0 0;padding:0;list-style:none;display:grid;gap:10px; } .ld-text li { color:#cfd3ea;font-size:15px;padding-left:28px;position:relative; } .ld-text li::before { content:"✓";position:absolute;left:0;color:#4ade80;font-weight:800; }
+.ld-demo { padding:20px;border-radius:22px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.09);display:grid;gap:10px; }
+.ld-day { padding:13px 16px;border-radius:14px;background:#1a1c26;border:1px solid rgba(255,255,255,.07);display:grid;grid-template-columns:1fr auto;gap:2px 10px; } .ld-day b { color:#fff;font-size:14px; } .ld-day span { color:#8a8fa8;font-size:12.5px; } .ld-day p { grid-column:1/-1;color:#b9bdd2!important;font-size:13.5px; }
+.ld-day.today { border-color:#6c8bff;box-shadow:0 0 0 3px rgba(108,139,255,.16); } .ld-day.rest { opacity:.6; } .ld-pg { grid-column:1/-1;display:flex;gap:6px;flex-wrap:wrap;margin-top:6px; } .ld-pg i { font-style:normal;font-size:12px;padding:2px 10px;border-radius:8px;background:rgba(245,158,11,.16);color:#fbbf24;font-weight:600; }
+.ld-mm { width:100%;height:auto; } .ld-mm path { fill:none;stroke-width:2.5;stroke-dasharray:300;stroke-dashoffset:300;} .lr.in .ld-mm path,.ld-mm.in path { animation:mmdraw 1.4s ease forwards; } .ld-mm text { fill:#fff;font-size:12.5px;font-weight:700;font-family:inherit; } .ld-mm .leaf rect { fill:rgba(255,255,255,.08);stroke:rgba(255,255,255,.25); } .ld-mm .leaf text { fill:#d9dbe6;font-weight:600;font-size:11.5px; }
+.ld-flow { display:flex;flex-wrap:wrap;justify-content:center;align-items:center;gap:10px;margin:0 auto 28px; } .ld-flow span { padding:10px 18px;border-radius:12px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);color:#e8e9f1;font-weight:700;font-size:13.5px; } .ld-flow span.end { background:linear-gradient(135deg,#4f6df5,#8e6cf4);border-color:transparent; } .ld-flow i { width:26px;height:2px;background:linear-gradient(90deg,#4f6df5,#ff7ac3);position:relative; } .ld-flow i::after { content:"";position:absolute;right:-1px;top:-3px;border:4px solid transparent;border-left:7px solid #ff7ac3; }
+.ld-faq { max-width:760px;margin:0 auto;display:grid;gap:10px; } .ld-faq details { border-radius:16px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);padding:0 20px;transition:border-color .2s; } .ld-faq details[open] { border-color:rgba(142,162,255,.5); }
+.ld-faq summary { cursor:pointer;list-style:none;padding:18px 0;font-weight:700;color:#fff;display:flex;justify-content:space-between;gap:12px; } .ld-faq summary::-webkit-details-marker { display:none; } .ld-faq summary::after { content:"+";color:#8ea2ff;font-size:22px;line-height:1;transition:transform .25s; } .ld-faq details[open] summary::after { transform:rotate(45deg); }
+.ld-faq p { padding:0 0 18px;color:#a6abc2!important;line-height:1.65;animation:akrise .35s both; }
+.ld-final { text-align:center;margin:110px auto 0;max-width:760px;padding:56px 24px;border-radius:28px;background:radial-gradient(500px circle at 50% 0,rgba(99,102,241,.35),transparent 70%),rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.12); }
+.ld-final img { width:64px;height:64px;border-radius:18px;margin-bottom:14px;animation:akpulse 4.5s ease-in-out infinite; } .ld-final h2 { font-size:clamp(26px,4vw,38px);font-weight:850;color:#fff!important; } .ld-final p { margin:12px 0 26px!important;color:#a6abc2!important; }
+.ld-foot { text-align:center;padding:60px 20px 50px;color:#8a8fa8;font-size:13px; } .ld-slogan { max-width:640px;margin:0 auto 20px!important;font-size:18px;font-style:italic;font-weight:600;line-height:1.55;background:linear-gradient(90deg,#8ea2ff,#ff9ad0);-webkit-background-clip:text;background-clip:text;color:transparent!important;-webkit-text-fill-color:transparent; } .ld-foot b { color:#fff;letter-spacing:.1em; } .ld-foot small { display:block;margin-top:8px;color:#6b6f86; }
+
+html:root:root:root:root body #landing .ld-hero h1,html:root:root:root:root body #landing .ld-head h2,html:root:root:root:root body #landing .ld-text h2,html:root:root:root:root body #landing .ld-card h3,html:root:root:root:root body #landing .ld-b h3,html:root:root:root:root body #landing .ld-step h3,html:root:root:root:root body #landing .ld-final h2 { color:#fff!important; }
+html:root:root:root:root body #landing .ld-head p,html:root:root:root:root body #landing .ld-card p,html:root:root:root:root body #landing .ld-b p,html:root:root:root:root body #landing .ld-step p,html:root:root:root:root body #landing .ld-text p { color:#9a9fb5!important; }
+html:root:root:root:root body #landing .ld-sub,html:root:root:root:root body #landing .ld-faq p,html:root:root:root:root body #landing .ld-final p { color:#a6abc2!important; }
+html:root:root:root:root body #landing .ld-day p { color:#b9bdd2!important; }
+html:root:root:root:root body #landing .ld-slogan { color:transparent!important; }
+html:root:root:root:root body #landing .ld-trust span,html:root:root:root:root body #landing .ld-marquee span { color:#8a8fa8!important; }
+html:root:root:root:root body #landing .ld-day span,html:root:root:root:root body #landing .ld-mini em,html:root:root:root:root body #landing .ld-bar span { color:#8a8fa8!important; }
+html:root:root:root:root body #landing .ld-day b,html:root:root:root:root body #landing .ld-mini b { color:#fff!important; }
+html:root:root:root:root body #landing .ld-pill { color:#cfd3ea!important; }
+html:root:root:root:root body #landing .ld-foot,html:root:root:root:root body #landing .ld-foot div { color:#8a8fa8!important; }
+@media (max-width:900px) { .ld-links { display:none; } .ld-bento { grid-template-columns:1fr 1fr; } .ld-split { grid-template-columns:1fr;gap:28px; } .ld-split.rev .ld-demo { order:0; } .ld-body { grid-template-columns:1fr; } .ld-side { display:none; } }
+@media (max-width:560px) { .ld-bento { grid-template-columns:1fr; } .ld-b.big { grid-column:auto; } }
+@media (prefers-reduced-motion: reduce) { .lr { transition:none;animation:none;opacity:1;transform:none; } .ld *,.ld-win { animation:none!important; } }
+
 .oral-card { border:1px solid var(--ak-line);border-radius:18px;background:var(--ak-card);padding:22px 26px; }
 .oral-tag { display:inline-block;font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:var(--ak-blue)!important;margin-bottom:8px; }
 .oral-card h3 { margin:0;font-size:21px;line-height:1.4;color:var(--ak-text)!important; }
@@ -4893,6 +5446,8 @@ I18N_SRC = r"""
   const PATTERNS = [["^(\\d+) maîtrisée\\(s\\) sur (\\d+) · (\\d+) à revoir$", "$1 mastered out of $2 · $3 to review"], ["^(\\d+) maîtrisée\\(s\\) sur (\\d+)$", "$1 mastered out of $2"], ["^(\\d+) quiz terminé\\(s\\) · moyenne (\\d+) % sur (\\d+) questions$", "$1 quiz(zes) completed · average $2% over $3 questions"], ["^(\\d+) colle\\(s\\) · moyenne (.+)\\/10$", "$1 oral(s) · average $2/10"], ["^Progression du cours · (.*)$", "Course progress · $1"], ["^Moyenne de 3 activités : flashcards, quiz et colle orale \\((\\d)\\/3 commencées\\)\\. Une activité non commencée compte pour 0 %\\.$", "Average of 3 activities: flashcards, quiz and oral exam ($1/3 started). An activity not started counts as 0%."], ["^dans le cours actif \\((\\d+) au total\\)$", "in the active course ($1 in total)"], ["^à l'assistant sur ce cours \\((\\d+) sur tous vos cours\\)$", "to the assistant on this course ($1 across all your courses)"], ["^(\\d+) quiz terminé\\(s\\), tous cours$", "$1 quiz(zes) completed, all courses"], ["^(\\d+) colle\\(s\\), tous cours$", "$1 oral(s), all courses"], ["^Flashcards (.+) · Quiz (.+) · Colle (.+)$", "Flashcards $1 · Quiz $2 · Oral $3"], ["^Revoyez vos (\\d+) flashcard\\(s\\) marquée\\(s\\) « à revoir »\\.$", "Review your $1 flashcard(s) marked “to review”."], ["^(\\d+) passages indexés · Progression du cours (\\d+)%$", "$1 indexed passages · Course progress $2%"], ["^⏳ Préparation de la question… \\((\\d+) s\\)$", "⏳ Preparing the question… ($1 s)"], ["^⏳ Correction en cours… \\((\\d+) s\\)$", "⏳ Grading in progress… ($1 s)"], ["^✅ Note : (\\d+)\\/10$", "✅ Score: $1/10"], ["^(\\d+) séance\\(s\\) · moyenne (.+)\\/10$", "$1 session(s) · average $2/10"], ["^Source : (.*)$", "Source: $1"], ["^(\\d+) cours · (\\d+) échanges · (.+)$", "$1 courses · $2 exchanges · $3"], ["^(\\d+) connexions$", "$1 sign-ins"], ["^✅ Mot de passe temporaire de « (.+) » : (.+) — à lui communiquer \\(affiché une seule fois\\)\\.$", "✅ Temporary password of “$1”: $2 — give it to the user (shown only once)."], ["^ℹ️ Pour supprimer « (.+) » : cochez la confirmation, puis cliquez sur « Supprimer le compte »\\.$", "ℹ️ To delete “$1”: tick the confirmation, then click “Delete the account”."], ["^ℹ️ Modification de « (.+) » : choisissez une action ci-dessous\\.$", "ℹ️ Editing “$1”: choose an action below."], ["^Clé API Gemini invalide : elle contient des caractères non autorisés \\(accents, symboles\\)\\. Collez la clé exacte, qui commence par AIza, dans le secret GEMINI_API_KEY\\.$", "Invalid Gemini API key: it contains forbidden characters (accents, symbols). Paste the exact key, starting with AIza, into the GEMINI_API_KEY secret."], ["^Gemini est très sollicité en ce moment\\. Réessayez dans une dizaine de secondes\\.(.*)$", "Gemini is very busy right now. Try again in about ten seconds.$1"], ["^Quota Gemini atteint : la limite de requêtes de votre clé est épuisée \\(par minute ou par jour\\)\\. Attendez une minute ou utilisez une autre clé\\.(.*)$", "Gemini quota reached: your key's request limit is used up (per minute or per day). Wait a minute or use another key.$1"], ["^Aucun modèle Gemini n'est accessible avec cette clé \\(404\\)\\. Vérifiez GEMINI_API_KEY et les noms de modèles\\.(.*)$", "No Gemini model is available with this key (404). Check GEMINI_API_KEY and the model names.$1"], ["^Connexion à Gemini impossible \\(réseau ou délai dépassé\\)\\. Réessayez dans un instant\\.(.*)$", "Cannot reach Gemini (network or timeout). Try again in a moment.$1"], ["^⏳ Lecture OCR des pages scannées (\\d+)\\/(\\d+)…$", "⏳ Reading scanned pages with OCR $1/$2…"], ["^✅ '(.+)' indexé avec succès \\((\\d+) fragments, OCR sur (\\d+) pages\\)\\.$", "✅ '$1' indexed successfully ($2 fragments, OCR on $3 pages)."], ["^Chapitre (\\d+)$", "Chapter $1"], ["^(\\d+) réponse\\(s\\)$", "$1 answer(s)"], ["^✅ '(.+)' indexé avec succès \\((\\d+) fragments\\)\\.$", "✅ '$1' indexed successfully ($2 fragments)."], ["^✅ '(.+)' est déjà indexé : réutilisé instantanément\\.$", "✅ '$1' is already indexed: reused instantly."], ["^❌ Erreur lors de l'indexation : (.*)$", "❌ Indexing error: $1"], ["^⏳ Indexation (\\d+)\\/(\\d+)…$", "⏳ Indexing $1/$2…"], ["^⚠️ Fichier trop volumineux \\(maximum (\\d+) Mo\\)\\.$", "⚠️ File too large (maximum $1 MB)."], ["^✅ (\\d+) flashcards prêtes !$", "✅ $1 flashcards ready!"], ["^⚠️ Seulement (\\d+) flashcard\\(s\\) obtenue\\(s\\) : il en faut au moins (\\d+)\\. Relancez la génération\\.$", "⚠️ Only $1 flashcard(s) obtained: at least $2 are needed. Generate again."], ["^❌ Erreur : (.*)$", "❌ Error: $1"], ["^⚠️ Génération impossible : (.*)$", "⚠️ Generation failed: $1"], ["^✅ Quiz de (\\d+) questions généré\\.$", "✅ Quiz of $1 questions generated."], ["^🎯 Quiz terminé : (\\d+)\\/(\\d+)\\.$", "🎯 Quiz completed: $1/$2."], ["^Score : (\\d+)$", "Score: $1"], ["^(\\d+)% de bonnes réponses$", "$1% correct answers"], ["^Bonne réponse : (.*)$", "Correct answer: $1"], ["^Le titre du document est : (.*)$", "The title of the document is: $1"], ["^QUIZ \\/ QCM · (.*)$", "QUIZ / MCQ · $1"], ["^(\\d+) fragments indexés · Progression (\\d+)% · RAG local$", "$1 indexed fragments · Progress $2% · Local RAG"], ["^Progression réelle · (.*)$", "Real progress · $1"], ["^Ajouté le (.*)$", "Added on $1"], ["^Indexé · (\\d+) fragments$", "Indexed · $1 fragments"], ["^✅ Compte « (.+) » (activé|désactivé)\\.$", "✅ Account “$1” updated."], ["^✅ Mot de passe de « (.+) » réinitialisé.*$", "✅ Password of “$1” reset (their remembered sign-ins are revoked)."], ["^✅ « (.+) » est maintenant (administrateur|utilisateur)\\.$", "✅ “$1” role updated."], ["^✅ Compte « (.+) » et toutes ses données supprimés\\.$", "✅ Account “$1” and all its data deleted."], ["^✅ Sauvegarde créée \\((.+)\\)\\.$", "✅ Backup created ($1)."], ["^✅ (\\d+) connexion\\(s\\) mémorisée\\(s\\) expirée\\(s\\) purgée\\(s\\)\\.$", "✅ $1 expired remembered sign-in(s) purged."], ["^✅ Journal allégé : (\\d+) ligne\\(s\\) ancienne\\(s\\) supprimée\\(s\\)\\.$", "✅ Log trimmed: $1 old line(s) removed."], ["^✅ Index et cours rechargés.*$", "✅ Indexes and courses will be reloaded from disk on each user's next action."], ["^⏳ Génération des flashcards… \\((\\d+) s\\)$", "⏳ Generating flashcards… ($1 s)"], ["^⏳ Génération du quiz… \\((\\d+) s\\)$", "⏳ Generating the quiz… ($1 s)"], ["^⏳ Génération du résumé… \\((\\d+) s\\)$", "⏳ Generating the summary… ($1 s)"], ["^C'est parti (.+) !$", "Let's go $1!"], ["^Bonjour (.+) 👋$", "Hello $1 👋"], ["^⚠️ Mot de passe trop court \\((\\d+) caractères minimum\\)\\.$", "⚠️ Password too short ($1 characters minimum)."]].map(([re, to]) => [new RegExp(re), to]);
   I18N.push(["Plan de révision", "Revision plan"],["Plan de révision intelligent", "Smart revision plan"],["Date de l'examen", "Exam date"],["Intitulé (facultatif)", "Title (optional)"],["Portée du plan", "Plan scope"],["Minutes de révision par jour", "Revision minutes per day"],["Générer / mettre à jour le plan", "Generate / update plan"],["Supprimer le plan", "Delete plan"],["Mes modules · espace semestriel", "My modules · semester space"],["Nouveau module", "New module"],["Semestre", "Semester"],["Créer le module", "Create module"],["Module du cours actif", "Active course module"],["Supprimer ce module", "Delete this module"],["Chercher dans", "Search in"],["Ce cours", "This course"],["Mon module", "My module"],["Tout mon espace", "My whole space"],["Mon historique de révision", "My revision history"],["Conversation du cours actif", "Active course conversation"],["Aujourd'hui", "Today"],["Demain", "Tomorrow"],["Hier", "Yesterday"],["Jour de repos : laissez la mémoire consolider.", "Rest day: let your memory consolidate."],["Jour de l'examen", "Exam day"],["Fait", "Done"],["Commencer", "Start"],["Jour J", "D-Day"],["de préparation estimée", "estimated readiness"],["page(s) faible(s) à relire", "weak page(s) to reread"],["min de révision cette semaine", "revision min this week"],["jour(s) d'affilée", "day streak"],["jour(s) étudié(s) sur 30", "day(s) studied out of 30"],["séance(s) au total", "session(s) in total"],["moyenne des quiz", "quiz average"],["14 derniers jours", "Last 14 days"],["Mes lacunes (notions les moins réussies aux quiz)", "My gaps (concepts least mastered in quizzes)"],["Votre journal de révision commence ici.", "Your revision journal starts here."],["Indiquez la date de votre examen.", "Enter your exam date."],["Sans module", "No module"],["Aucun module", "No module"],["Tous mes cours", "All my courses"],["Jour de repos", "Rest day"]);
   I18N.push(["Mes dossiers et modules", "My folders and modules"],["Importez vos PDF (même scannés) et rangez-les par module et par semestre.", "Import your PDFs (even scanned ones) and sort them by module and semester."],["Ajoutez un ou plusieurs PDF : AKORI lit le texte, lance l'OCR si la page est une image, puis indexe chaque page.", "Add one or more PDFs: AKORI reads the text, runs OCR if a page is an image, then indexes every page."],["Créez un module par matière (ex. Réseaux, Algorithmique) et choisissez son semestre.", "Create a module per subject (e.g. Networks, Algorithms) and pick its semester."],["Rangez directement vos nouveaux fichiers dans un module au moment de l'import.", "File your new documents straight into a module when you import them."],["Un semestre contient souvent plusieurs cours : un module les réunit pour les interroger ensemble.", "A semester often holds several courses: a module groups them so you can query them together."],["Importer un PDF", "Import a PDF"],["Les points clés du cours en un coup d'œil, dans votre langue.", "The key points of the course at a glance, in your language."],["Choisissez le cours actif en haut de la page.", "Pick the active course at the top of the page."],["Lancez « Générer le résumé » : le texte est conservé avec le cours.", "Click “Generate summary”: the text is saved with the course."],["Relisez-le la veille d'un examen, ou au début d'une séance.", "Reread it the day before an exam, or at the start of a session."],["Le résumé revient dans votre plan de révision comme première étape.", "The summary comes back in your revision plan as the first step."],["Générer le résumé", "Generate summary"],["Posez vos questions : la réponse s'appuie sur votre cours, avec la page citée.", "Ask your questions: the answer relies on your course, with the page cited."],["Choisissez où chercher : ce cours, tout un module, ou tout votre espace.", "Choose where to search: this course, a whole module, or your whole space."],["Lisez la réponse et ouvrez « Sources » pour voir les passages et les pages utilisés.", "Read the answer and open “Sources” to see the passages and pages used."],["Épinglez une réponse dans « À revoir », ou écoutez-la à voix haute.", "Pin an answer to “To review”, or listen to it aloud."],["Si l'information n'est pas dans vos cours, AKORI le dit au lieu d'inventer.", "If the information is not in your courses, AKORI says so instead of making it up."],["Poser une question", "Ask a question"],["Au moins 7 cartes en mode roulette pour mémoriser activement.", "At least 7 cards in roulette mode to memorize actively."],["Générez les cartes à partir du cours actif.", "Generate the cards from the active course."],["Cliquez pour stopper la roulette, essayez de répondre, puis affichez la réponse.", "Click to stop the roulette, try to answer, then reveal the answer."],["Marquez « Je savais » ou « À revoir » : les cartes à revoir reviennent dans votre plan.", "Mark “I knew it” or “To review”: cards to review come back in your plan."],["Mieux vaut 10 minutes chaque jour qu'une heure la veille : c'est la répétition espacée.", "10 minutes every day beat one hour the night before: that is spaced repetition."],["Lancer la roulette", "Spin the roulette"],["Testez-vous : correction expliquée, points forts et points faibles.", "Test yourself: explained corrections, strengths and weaknesses."],["Générez un quiz de 5 questions.", "Generate a 5-question quiz."],["Répondez, validez, lisez l'explication, puis passez à la suite.", "Answer, validate, read the explanation, then move on."],["Vos erreurs alimentent la carte de vos lacunes et les pages à relire.", "Your mistakes feed your gap map and the pages to reread."],["Un quiz raté n'est pas un échec : il indique exactement quelle page relire.", "A failed quiz is not a failure: it tells you exactly which page to reread."],["Passer un quiz", "Take a quiz"],["Répondez à l'oral ou à l'écrit, comme devant un examinateur.", "Answer aloud or in writing, as in front of an examiner."],["AKORI choisit un passage de votre cours et pose une question ouverte.", "AKORI picks a passage from your course and asks an open question."],["Dictez votre réponse au micro ou écrivez-la.", "Dictate your answer to the microphone or type it."],["Recevez une note sur 10, ce qui manquait, et la page à relire.", "Get a mark out of 10, what was missing, and the page to reread."],["Dire la réponse à voix haute révèle ce que vous maîtrisez vraiment.", "Saying the answer aloud reveals what you really master."],["Passer une colle", "Take an oral"],["Indiquez la date de l'examen : AKORI construit le plan jour par jour.", "Enter the exam date: AKORI builds a day-by-day plan."],["Saisissez la date, la portée (un cours, un module, tout) et le temps disponible par jour.", "Enter the date, the scope (a course, a module, everything) and your daily time."],["Le plan mélange vos points faibles et une répétition espacée (1, 3, 7 puis 14 jours).", "The plan mixes your weak points with spaced repetition (1, 3, 7 then 14 days)."],["Il se recalcule après chaque séance et vous indique les pages à relire.", "It recalculates after every session and shows the pages to reread."],["Un jour de repos est prévu : la mémoire consolide aussi quand vous ne travaillez pas.", "A rest day is planned: memory also consolidates when you are not working."],["Créer mon plan", "Create my plan"],["Retrouvez les réponses épinglées, cours par cours.", "Find your pinned answers, course by course."],["Épinglez une réponse de l'assistant depuis le chat.", "Pin an assistant answer from the chat."],["Retrouvez-la ici, rangée par cours.", "Find it here, sorted by course."],["Relisez-la ou écoutez-la avant l'examen.", "Reread it or listen to it before the exam."],["C'est votre fiche de révision personnelle, écrite avec vos propres questions.", "It is your personal revision sheet, written with your own questions."],["Ouvrir À revoir", "Open To review"],["Un état clair : flashcards, quiz et colle orale, cours par cours.", "A clear status: flashcards, quizzes and oral practice, course by course."],["Consultez la vue globale, puis le détail du cours choisi.", "Check the global view, then the detail of the chosen course."],["Chaque pourcentage précise sur quoi il porte (cartes maîtrisées, quiz terminés…).", "Each percentage states what it measures (mastered cards, completed quizzes…)."],["Repérez les notions à renforcer.", "Spot the concepts to reinforce."],["La progression d'un cours est la moyenne de ses trois activités.", "A course's progress is the average of its three activities."],["Voir ma progression", "See my progress"],["Votre journal de révision et la carte de vos lacunes.", "Your revision journal and the map of your gaps."],["Chaque séance est notée : quiz, flashcards, colle orale, questions.", "Every session is logged: quizzes, flashcards, oral practice, questions."],["Suivez votre série de jours et vos notions les moins réussies.", "Follow your day streak and your least mastered concepts."],["L'assistant adapte ses explications à votre niveau et à vos résultats.", "The assistant adapts its explanations to your level and your results."],["Plus vous révisez, plus les réponses s'ajustent à vous.", "The more you revise, the better the answers fit you."],["Ouvrir l'historique", "Open history"],["Réviser, c'est reprendre, comprendre, mémoriser et maîtriser : chaque notion, avec les mots et les exemples de votre cours.", "To revise is to revisit, understand, memorize and master: every concept, in the words and examples of your course."],["💡 Guide de révision : cliquez sur une fonction pour la découvrir en détail", "💡 Revision guide: click a feature to explore it in detail"],["AKORI transforme vos cours PDF en un espace de révision intelligent : résumé, flashcards roulette, quiz, colle orale, plan de révision et assistant RAG.", "AKORI turns your PDF courses into a smart revision space: summary, roulette flashcards, quiz, oral practice, revision plan and RAG assistant."],["Plan", "Plan"],["Assistant IA", "AI Assistant"],["Ajouter les nouveaux fichiers au module", "Add new files to the module"],["Sélectionnez un ou plusieurs PDF : extraction et indexation automatiques.", "Select one or more PDFs: automatic extraction and indexing."],["Un semestre contient souvent plusieurs cours. Regroupez-les par module (matière) et par semestre pour interroger simultanément plusieurs unités d'enseignement (ex. Systèmes d'exploitation, Réseaux, Algorithmique) au sein d'un même espace de travail : dans l'Assistant IA, choisissez « Mon module » ou « Tout mon espace ».", "A semester often holds several courses. Group them by module (subject) and semester to query several teaching units at once (e.g. Operating Systems, Networks, Algorithms) within one workspace: in the AI Assistant, choose “My module” or “My whole space”."],["AKORI suit vos interactions (quiz, flashcards, colle orale, questions) pour cartographier vos lacunes conceptuelles et adapter dynamiquement le niveau d'explication des réponses générées par l'assistant.", "AKORI tracks your interactions (quizzes, flashcards, oral practice, questions) to map your conceptual gaps and dynamically adapt the explanation level of the assistant's answers."]);
+  I18N.push(["Générez un quiz de 5 questions.", "Generate a 5-question quiz."],["Touchez une réponse : la correction et l'explication s'affichent aussitôt, sans valider.", "Tap an answer: the correction and explanation appear instantly, no need to validate."],["Glissez vers la gauche pour passer à la question suivante. Vos erreurs alimentent la carte de vos lacunes.", "Swipe left to go to the next question. Your mistakes feed your gap map."],["La carte mentale du cours, d'un seul regard.", "The course mind map at a glance."],["Choisissez le cours actif puis lancez « Générer la mindmap ».", "Pick the active course then click “Generate mind map”."],["Le thème est au centre, les grandes notions autour, leurs détails au bout des branches.", "The theme is at the center, the main concepts around it, their details at the branch tips."],["Cliquez sur une branche pour la replier ou la déplier et réviser bloc par bloc.", "Click a branch to fold or unfold it and revise block by block."],["La carte est conservée avec le cours : vous la retrouvez à chaque visite.", "The map is saved with the course: you find it at every visit."],["Ouvrir la mindmap", "Open the mind map"],["Mindmap", "Mind map"],["Mindmap du cours", "Course mind map"],["À propos", "About"],["✦ Générer la mindmap", "✦ Generate mind map"],["Générer la mindmap", "Generate mind map"],["La carte mentale du cours actif : le thème au centre, les grandes notions autour, leurs détails au bout. Cliquez sur une branche pour la replier.", "The mind map of the active course: the theme at the center, main concepts around it, details at the tips. Click a branch to fold it."],["Touchez une réponse : la correction s'affiche aussitôt.", "Tap an answer: the correction appears instantly."],["Cliquez sur une branche pour la replier ou la déplier.", "Click a branch to fold or unfold it."],["Aucune mindmap pour ce cours.", "No mind map for this course."],["← Présentation d'AKORI", "← About AKORI"]);
+  I18N.push(["Touchez une réponse : la correction s'affiche aussitôt. Glissez vers la gauche pour passer à la question suivante.", "Tap an answer: the correction appears instantly. Swipe left to go to the next question."]);
   const EXACT = new Map(I18N.map(([fr, en]) => [fr.trim(), en]));
   const codeOf = (label) => /English/.test(String(label)) ? 'en' : 'fr';
   const labelOf = (code) => code === 'en' ? 'English' : 'Français';
@@ -4957,6 +5512,7 @@ I18N_SRC = r"""
     play: '<polygon points="5 3 19 12 5 21 5 3"/>',
     trend: '<polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/>',
     clock: '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
+    mind: '<circle cx="5" cy="12" r="2.6"/><circle cx="19" cy="5" r="2.6"/><circle cx="19" cy="19" r="2.6"/><path d="M7.5 11l9-5M7.5 13l9 5"/>',
     cal: '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/>',
   };
   const ICON_MAP = {'✅': 'check', '✓': 'check', '⚠️': 'alert', '⚠': 'alert', '❌': 'xcircle', '✕': 'x', '✗': 'x', '⛔': 'ban',
@@ -4964,7 +5520,7 @@ I18N_SRC = r"""
     '🏆': 'trophy', '📌': 'pin', '📎': 'clip', '🔊': 'sound', '🧠': 'layers', '📝': 'edit', '💡': 'bulb', '📚': 'book', '📁': 'folder',
     '📂': 'folder', '🛡': 'shield', '🎰': 'dice', '📦': 'box', '🔑': 'key', '🚀': 'arrow', '🎉': 'sparkle', '🏫': 'school',
     '🎓': 'cap', '⚡': 'bolt', '💬': 'chat', '👤': 'user', '🤖': 'sparkle', '🔎': 'search', '🎤': 'mic', '🗑': 'trash',
-    '🔒': 'lock', '▶': 'play', '👋': '', '📅': 'cal', '🗓': 'cal', '📖': 'book', '📈': 'trend', '🕑': 'clock'};
+    '🔒': 'lock', '▶': 'play', '👋': '', '📅': 'cal', '🗓': 'cal', '📖': 'book', '📈': 'trend', '🕑': 'clock', '🕸': 'mind'};
   const STATUS = {'✅': 'ok', '⚠️': 'err', '⚠': 'err', '❌': 'err', '⛔': 'err'};
   const EMO_ALT = Object.keys(ICON_MAP).sort((a, b) => b.length - a.length).map((k) => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
   const LEAD = new RegExp('^(\\s*)(' + EMO_ALT + ')\\uFE0F?\\s*([\\s\\S]*)$', 'u');
@@ -5394,6 +5950,45 @@ AKORI_NAV_JS = r"""
     const r = hero.getBoundingClientRect();
     hero.style.setProperty('--mx', (event.clientX - r.left) + 'px');
     hero.style.setProperty('--my', (event.clientY - r.top) + 'px');
+  });
+  // Page de présentation : apparition au défilement, ancres, bouton « Se connecter »
+  const lrIO = 'IntersectionObserver' in window ? new IntersectionObserver((entries) => entries.forEach((e) => { if (e.isIntersecting) { e.target.classList.add('in'); lrIO.unobserve(e.target); } }), { threshold: .12 }) : null;
+  const scanLr = () => document.querySelectorAll('.lr:not(.in):not([data-lr])').forEach((el) => { el.dataset.lr = '1'; if (lrIO) lrIO.observe(el); else el.classList.add('in'); });
+  new MutationObserver(scanLr).observe(document.body, { childList: true, subtree: true });
+  scanLr();
+  document.addEventListener('click', (event) => {
+    const login = event.target.closest && event.target.closest('.ld-login');
+    if (login) { const b = document.getElementById('land-login-btn'); if (b) { b.click(); window.scrollTo({ top: 0 }); } return; }
+    const anchor = event.target.closest && event.target.closest('.ld-links a, .ld a[href^="#ld-"]');
+    if (anchor) { event.preventDefault(); const t = document.getElementById(anchor.getAttribute('href').slice(1)); if (t) t.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+    const br = event.target.closest && event.target.closest('.mm-bnode');
+    if (br) br.closest('.mm-br').classList.toggle('mm-closed');
+    const opt = event.target.closest && event.target.closest('button.opt-click');
+    if (opt) { const m = opt.className.match(/ak-o-(\d+)/); if (m) { opt.classList.add('selected'); sendHidden('quiz-pick-box', 'quiz-pick-btn', m[1]); } return; }
+    if (event.target.closest && event.target.closest('.ak-quiz-next')) quizNext();
+  });
+  // Quiz : glisser vers la gauche (ou flèche droite) pour passer à la suite une fois la correction affichée
+  const quizNext = () => {
+    const card = document.querySelector('.quiz-card');
+    const next = document.getElementById('quiz_next');
+    if (!card || !next || !card.querySelector('.quiz-verdict')) return;
+    card.classList.add('swipe-out');
+    window.setTimeout(() => next.click(), 190);
+  };
+  let swX = null, swY = null;
+  document.addEventListener('pointerdown', (event) => {
+    const card = event.target.closest && event.target.closest('.quiz-card');
+    if (!card || event.target.closest('button')) { swX = null; return; }
+    swX = event.clientX; swY = event.clientY;
+  });
+  document.addEventListener('pointerup', (event) => {
+    if (swX === null) return;
+    const dx = event.clientX - swX, dy = event.clientY - swY;
+    swX = null;
+    if (dx < -70 && Math.abs(dy) < 70) quizNext();
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'ArrowRight' && document.querySelector('.quiz-card .quiz-verdict') && !/INPUT|TEXTAREA/.test((document.activeElement || {}).tagName || '')) quizNext();
   });
   // Compteurs animés (0 -> valeur) à l'apparition des chiffres
   const countUp = (el) => {
@@ -6179,6 +6774,11 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
     token_out = gr.Textbox(elem_classes="akori-hidden", show_label=False, container=False)
 
     with gr.Column(visible=True, elem_id="login-view", elem_classes="akori-dark-page") as login_view:
+      with gr.Column(visible=True, elem_id="landing") as landing_col:
+        gr.HTML(landing_html())
+        land_login_btn = gr.Button("login", elem_id="land-login-btn", elem_classes="akori-hidden")
+      with gr.Column(visible=False, elem_id="login-wrap") as login_wrap:
+        back_land = gr.Button("← Présentation d'AKORI", elem_id="back-land", elem_classes="link-btn")
         gr.HTML(f"<div class='auth-brand'><img class='brand-logo' src='{LOGO_DATA_URI}' alt='AKORI'><span>AKORI</span></div>")
         with gr.Column(visible=True, elem_id="login-panel", elem_classes="auth-panel") as login_panel:
             gr.HTML("<div class='auth-title'><h1>Content de te revoir</h1><p>Connecte-toi pour accéder à tes cours</p></div>")
@@ -6193,7 +6793,7 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
                 go_register = gr.Button("Créer un compte", elem_classes="link-btn accent")
         with gr.Column(visible=False, elem_id="register-panel", elem_classes="auth-panel") as register_panel:
             gr.HTML("<div class='auth-title'><h1>Crée ton compte</h1><p>Gratuit, sans carte bancaire</p></div>")
-            su_user = gr.Textbox(label="Email", placeholder="ton@email.com", elem_id="su-user")
+            su_user = gr.Textbox(label="Email", placeholder="prenom.nom@gmail.com", elem_id="su-user", info="Une adresse e-mail réelle que vous consultez : les adresses jetables ou inexistantes sont refusées.")
             su_pass = gr.Textbox(label="Mot de passe", type="password", placeholder="8 caractères minimum", elem_id="su-pass")
             su_pass2 = gr.Textbox(label="Confirmer le mot de passe", type="password", placeholder="••••••••", elem_id="su-pass2")
             su_remember = gr.State(True)
@@ -6240,6 +6840,7 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
                 nav_quiz = gr.Button("Quiz / QCM", elem_id="nav-quiz", elem_classes="navbtn")
                 nav_oral = gr.Button("Colle orale", elem_id="nav-oral", elem_classes="navbtn")
                 nav_summary = gr.Button("Résumé", elem_id="nav-summary", elem_classes="navbtn")
+                nav_mindmap = gr.Button("Mindmap", elem_id="nav-mindmap", elem_classes="navbtn")
                 nav_assistant = gr.Button("Assistant IA", elem_id="nav-assistant", elem_classes="navbtn")
                 nav_progress = gr.Button("Progression", elem_id="nav-progress", elem_classes="navbtn")
                 nav_reviewq = gr.Button("À revoir", elem_id="nav-reviewq", elem_classes="navbtn")
@@ -6313,7 +6914,7 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
 
                     with gr.Tab("Quiz / QCM", id="quiz"):
                         gr.Markdown("## Quiz d'évaluation")
-                        gr.Markdown("Cliquez sur une réponse, validez, puis passez à la question suivante.")
+                        gr.Markdown("Touchez une réponse : la correction s'affiche aussitôt. Glissez vers la gauche pour passer à la question suivante.")
                         with gr.Row():
                             generate_quiz_btn = gr.Button("✦ Générer le quiz", variant="primary")
                             quiz_restart = gr.Button("🔁 Rejouer")
@@ -6323,9 +6924,10 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
                             choices=[], label="Choisissez votre réponse", container=False,
                             interactive=True, visible=False, elem_classes="quiz-radio-group",
                         )
-                        with gr.Row():
-                            quiz_validate = gr.Button("Valider la réponse", variant="primary", elem_id="quiz_validate")
-                            quiz_next = gr.Button(NEXT_LABEL, elem_id="quiz_next")
+                        quiz_pick = gr.Textbox(elem_id="quiz-pick-box", elem_classes="akori-hidden", show_label=False, container=False)
+                        quiz_pick_btn = gr.Button("pick", elem_id="quiz-pick-btn", elem_classes="akori-hidden")
+                        quiz_validate = gr.Button("Valider la réponse", elem_id="quiz_validate", elem_classes="akori-hidden")
+                        quiz_next = gr.Button(NEXT_LABEL, elem_id="quiz_next", elem_classes="akori-hidden")
 
                     with gr.Tab("Colle orale", id="oral"):
                         gr.Markdown("## Colle orale")
@@ -6345,6 +6947,13 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
                         gr.Markdown("## Résumé du cours")
                         summary_btn = gr.Button("Générer le résumé", variant="primary")
                         summary_output = gr.Markdown("Sélectionnez un cours puis lancez la génération.")
+
+                    with gr.Tab("Mindmap", id="mindmap") as tab_mindmap:
+                        gr.Markdown("## Mindmap du cours")
+                        gr.Markdown("La carte mentale du cours actif : le thème au centre, les grandes notions autour, leurs détails au bout. Cliquez sur une branche pour la replier.")
+                        mm_btn = gr.Button("✦ Générer la mindmap", variant="primary", elem_id="mm-gen")
+                        mm_status = gr.Markdown("", elem_id="mm-status")
+                        mm_box = gr.HTML(mindmap_html(None))
 
                     with gr.Tab("Assistant IA", id="assistant"):
                         gr.Markdown("## Assistant AKORI")
@@ -6389,6 +6998,8 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
                         with gr.Row(elem_classes="set-card"):
                             gr.HTML("<div class='set-text'><div class='set-title'>Langue</div><div class='set-desc'>Langue de l'interface et des réponses générées par l'IA.</div></div>")
                             lang_choice = gr.Radio(choices=LANG_CHOICES, value="Français", show_label=False, container=False, elem_id="lang-choice", scale=0)
+                        gr.Markdown("### À propos")
+                        gr.HTML(about_html())
 
                     with gr.Tab("Profil", id="profile"):
                         gr.Markdown("## Mon profil")
@@ -6576,6 +7187,12 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
     nav_reviewq.click(lambda: gr.Tabs(selected="reviewq"), outputs=tabs, queue=False)
     nav_history.click(lambda: gr.Tabs(selected="history"), outputs=tabs, queue=False)
     nav_plan.click(lambda: gr.Tabs(selected="plan"), outputs=tabs, queue=False)
+    nav_mindmap.click(lambda: gr.Tabs(selected="mindmap"), outputs=tabs, queue=False)
+    mm_btn.click(lambda: "⏳ Construction de la mindmap…", outputs=[mm_status], queue=False).then(
+        mindmap_generate_handler, [doc_selector, lang_choice], [mm_box, mm_status], show_progress="hidden", concurrency_limit=2).then(
+        after_session_refresh, None, [plan_box, journal_box], queue=False, show_progress="hidden")
+    tab_mindmap.select(mindmap_view, [doc_selector, lang_choice], [mm_box, mm_status], queue=False, show_progress="hidden")
+    doc_selector.change(mindmap_view, [doc_selector, lang_choice], [mm_box, mm_status], queue=False, show_progress="hidden")
     tab_plan.select(plan_open, None, [plan_box, plan_date, plan_name, plan_scope, plan_minutes, plan_status], queue=False, show_progress="hidden")
     tab_history.select(journal_html, None, [journal_box], queue=False, show_progress="hidden")
     plan_btn.click(plan_save, [plan_date, plan_name, plan_scope, plan_minutes], [plan_box, plan_status], queue=False)
@@ -6667,12 +7284,12 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
         lambda: "⏳ Génération du quiz…", outputs=[quiz_status], queue=False
     ).then(quiz_generate_handler, inputs=[doc_selector, lang_choice], outputs=quiz_outputs, show_progress="minimal")
     quiz_restart.click(quiz_restart_handler, inputs=[quiz_state, doc_selector], outputs=quiz_outputs, queue=False)
-    quiz_validate.click(
+    quiz_pick_btn.click(
         quiz_validate_handler,
-        inputs=[quiz_state, quiz_index, quiz_choice, quiz_validated, quiz_answers, doc_selector],
+        inputs=[quiz_state, quiz_index, quiz_pick, quiz_validated, quiz_answers, doc_selector],
         outputs=[quiz_validated, quiz_view_box, quiz_status, quiz_answers, quiz_choice, quiz_next],
         queue=False,
-    )
+    ).then(lambda: "", None, quiz_pick, queue=False, show_progress="hidden")
     quiz_next.click(
         quiz_next_handler,
         inputs=[quiz_state, quiz_index, quiz_validated, quiz_answers, doc_selector],
@@ -6730,10 +7347,16 @@ with gr.Blocks(title="AKORI — AI Study Assistant") as demo:
     _after_enter(su_btn.click(do_register, [su_user, su_pass, su_pass2, su_remember], ENTER_OUT))
     _after_enter(su_pass2.submit(do_register, [su_user, su_pass, su_pass2, su_remember], ENTER_OUT))
     _after_enter(nav_logout.click(do_logout, [token_in], ENTER_OUT, js=LOGOUT_JS)).then(
-        lambda: (gr.update(visible=True), gr.update(visible=False)), None, [login_panel, register_panel], queue=False)
+        lambda: (gr.update(visible=True), gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)), None,
+        [login_panel, register_panel, login_wrap, landing_col], queue=False)
     _after_enter(token_in.change(do_auto_login, [token_in], ENTER_OUT))
     token_out.change(None, token_out, None, js=TOKEN_STORE_JS)
     demo.load(None, None, token_in, js=GET_TOKEN_JS)
+
+    # page de présentation -> connexion
+    land_login_btn.click(lambda: (gr.update(visible=False), gr.update(visible=True), gr.update(visible=True), gr.update(visible=False), "", ""), None,
+                         [landing_col, login_wrap, login_panel, register_panel, login_status, register_status], queue=False)
+    back_land.click(lambda: (gr.update(visible=True), gr.update(visible=False)), None, [landing_col, login_wrap], queue=False)
 
     # connexion <-> création de compte (sans aller-retour serveur lourd)
     go_register.click(lambda: (gr.update(visible=False), gr.update(visible=True), "", ""), None,
