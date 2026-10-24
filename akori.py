@@ -412,7 +412,10 @@ def _resolve_data_dir():
     _migrate_local_to_drive(LOCAL_DATA_DIR, target)
     print(f"✅ Données AKORI enregistrées dans Google Drive : {target}")
     return target, True
-  print("⚠️ Google Drive indisponible : les données sont temporaires (perdues à la fermeture de Colab).")
+  if os.path.isdir("/data") and os.access("/data", os.W_OK):
+    print("✅ Données AKORI enregistrées dans /data (disque de l'hébergeur).")
+    return "/data", True
+  print("⚠️ Aucun stockage persistant (Google Drive ou /data) : les données sont temporaires (perdues au redémarrage).")
   return LOCAL_DATA_DIR, False
 
 
@@ -705,6 +708,9 @@ def _user_docs_dir(key):
 
 
 DEFAULT_ADMIN_PASSWORD = "admin123"   # identifiants par défaut : admin / admin123 (à changer dans la console admin)
+# Serveur public (Hugging Face, Render, Fly, Docker…) : jamais de mot de passe admin connu d'avance.
+PUBLIC_DEPLOY = (os.getenv("AKORI_PUBLIC") == "1" or bool(os.getenv("SPACE_ID")) or bool(os.getenv("RENDER"))
+                 or bool(os.getenv("FLY_APP_NAME")) or bool(os.getenv("RAILWAY_ENVIRONMENT")))
 
 
 def _bootstrap_admin():
@@ -722,7 +728,7 @@ def _bootstrap_admin():
   # Ancien compte admin créé avec un mot de passe aléatoire (fichier ADMIN_INITIAL_PASSWORD.txt encore là) :
   # il repasse aux identifiants par défaut admin / admin123.
   legacy_note = os.path.join(DATA_DIR, "ADMIN_INITIAL_PASSWORD.txt")
-  if "admin" in users and users["admin"].get("role") == "admin" and os.path.exists(legacy_note):
+  if not PUBLIC_DEPLOY and "admin" in users and users["admin"].get("role") == "admin" and os.path.exists(legacy_note):
     with _STORE_LOCK:
       users = _users()
       users["admin"]["salt"], users["admin"]["hash"] = _hash_password(DEFAULT_ADMIN_PASSWORD)
@@ -733,7 +739,7 @@ def _bootstrap_admin():
     print(f"🛡  Compte administrateur : admin / {DEFAULT_ADMIN_PASSWORD}")
   if not any(u.get("role") == "admin" for u in users.values()):
     name = os.getenv("AKORI_ADMIN_USER", "admin")
-    password = os.getenv("AKORI_ADMIN_PASSWORD") or DEFAULT_ADMIN_PASSWORD
+    password = os.getenv("AKORI_ADMIN_PASSWORD") or (secrets.token_urlsafe(12) if PUBLIC_DEPLOY else DEFAULT_ADMIN_PASSWORD)
     generated = True
     ok, msg = _create_user(name, password, role="admin", allow_username=True, onboarded=True)
     if ok and generated:
@@ -5182,6 +5188,56 @@ html:root:root:root:root body #landing .ld-foot,html:root:root:root:root body #l
 @media (max-width:560px) { .ld-bento { grid-template-columns:1fr; } .ld-b.big { grid-column:auto; } }
 @media (prefers-reduced-motion: reduce) { .lr { transition:none;animation:none;opacity:1;transform:none; } .ld *,.ld-win { animation:none!important; } }
 
+
+/* ===== téléphone : menu en tiroir, pages pleine largeur, gestes fluides (classe m-mode posée par le script) ===== */
+#m-burger { display:none;position:fixed;top:max(10px,env(safe-area-inset-top));left:12px;z-index:250;width:44px;height:44px;border-radius:14px;
+  border:1px solid var(--ak-line);background:var(--ak-card);color:var(--ak-text);box-shadow:0 6px 18px rgba(42,55,90,.16);align-items:center;justify-content:center;padding:0;cursor:pointer; }
+#m-burger svg { width:22px;height:22px; }
+#m-backdrop { position:fixed;inset:0;background:rgba(10,14,28,.5);opacity:0;pointer-events:none;transition:opacity .25s ease;z-index:280; }
+html:root:root:root:root body.m-mode.in-app #m-burger { display:flex; }
+html:root:root:root:root body.m-mode.m-nav-open #m-backdrop { opacity:1;pointer-events:auto; }
+html:root:root:root:root body.m-mode { --sb-w:min(300px,84vw); --main-ml:0px; }
+html:root:root:root:root body.m-mode #sidebar {
+  left:0!important;top:0!important;height:100dvh!important;max-height:100dvh!important;border-radius:0 22px 22px 0!important;
+  width:min(300px,84vw)!important;min-width:min(300px,84vw)!important;max-width:min(300px,84vw)!important;
+  transform:translateX(-106%);transition:transform .3s var(--sb-ease)!important;z-index:300;padding-top:max(16px,env(safe-area-inset-top))!important;
+  padding-bottom:max(12px,env(safe-area-inset-bottom))!important;will-change:transform;
+}
+html:root:root:root:root body.m-mode.m-nav-open #sidebar { transform:none;box-shadow:0 0 60px rgba(15,23,42,.45)!important; }
+html:root:root:root:root body.m-mode #sidebar #sidebar-toggle { display:none!important; }
+html:root:root:root:root body.m-mode #sidebar .navbtn { min-height:46px!important; }
+html:root:root:root:root body.m-mode #main-column { margin-left:0!important;padding-top:54px; }
+html:root:root:root:root body.m-mode #topbar { margin-bottom:4px!important; }
+html:root:root:root:root body.m-mode .gradio-container .main { padding-left:0!important;padding-right:0!important; }
+html:root:root:root:root body.m-mode #main-tabs .html-container { padding-left:0!important;padding-right:0!important; }
+html:root:root:root:root body.m-mode #topbar > * { flex:1 1 100%!important;min-width:100%!important; }
+html:root:root:root:root body.m-mode .gradio-container { padding-left:10px!important;padding-right:10px!important; }
+html:root:root:root:root body.m-mode #main-tabs .tabitem { min-height:0!important; }
+html:root:root:root:root body.m-mode .gradio-container button, html:root:root:root:root body.m-mode .gradio-container [role="tab"] { min-height:44px; }
+html:root:root:root:root body.m-mode .gradio-container input, html:root:root:root:root body.m-mode .gradio-container textarea, html:root:root:root:root body.m-mode .gradio-container select { font-size:16px!important; }
+html:root:root:root:root body.m-mode .stat-row { grid-template-columns:1fr 1fr!important; }
+html:root:root:root:root body.m-mode .guide-grid, html:root:root:root:root body.m-mode .folder-grid, html:root:root:root:root body.m-mode .global-metrics { grid-template-columns:1fr!important; }
+html:root:root:root:root body.m-mode .hero { padding:22px 18px!important; }
+html:root:root:root:root body.m-mode .gc-detail { padding-left:18px!important; }
+html:root:root:root:root body.m-mode #assistant-chatbot { height:calc(100dvh - 330px)!important;min-height:300px!important; }
+html:root:root:root:root body.m-mode .quiz-card, html:root:root:root:root body.m-mode .flashcard { padding:18px!important; }
+html:root:root:root:root body.m-mode .quiz-card h2 { font-size:18px!important; }
+html:root:root:root:root body.m-mode button.option.opt-click { padding:14px 12px;min-height:52px; }
+html:root:root:root:root body.m-mode .plan-task { flex-wrap:wrap; }
+html:root:root:root:root body.m-mode .plan-head { flex-direction:column;align-items:flex-start; }
+html:root:root:root:root body.m-mode .jr-gap { grid-template-columns:1fr 44px; } html:root:root:root:root body.m-mode .jr-gap .act-bar { grid-column:1/-1;order:3; }
+html:root:root:root:root body.m-mode #sidebar, html:root:root:root:root body.m-mode #sidebar * { transition-duration:.2s; }
+/* page de présentation sur téléphone : pleine largeur, effets lourds coupés */
+html:root:root:root:root body.m-mode:has(#landing) .gradio-container { padding:0!important;max-width:none!important; }
+html:root:root:root:root body.m-mode .ld-nav { padding:10px 14px; } html:root:root:root:root body.m-mode .ld-nav .ld-btn { padding:9px 14px;white-space:nowrap;font-size:13.5px; }
+html:root:root:root:root body.m-mode .ld-hero { padding:48px 16px 20px; } html:root:root:root:root body.m-mode .ld-sec { padding:64px 16px 0; }
+html:root:root:root:root body.m-mode .ld-cta .ld-btn { width:100%;justify-content:center; }
+html:root:root:root:root body.m-mode .ld-orb { animation:none;filter:blur(48px);opacity:.7; }
+html:root:root:root:root body.m-mode .ld-win { animation:none;transform:none; }
+html:root:root:root:root body.m-mode .ld-nav { backdrop-filter:none;background:rgba(10,10,12,.94); }
+html:root:root:root:root body.m-mode .hero-glow, html:root:root:root:root body.m-mode .art-blob { animation:none; }
+html:root:root:root:root body.m-mode .ld-marquee { animation-duration:55s; }
+
 .oral-card { border:1px solid var(--ak-line);border-radius:18px;background:var(--ak-card);padding:22px 26px; }
 .oral-tag { display:inline-block;font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:var(--ak-blue)!important;margin-bottom:8px; }
 .oral-card h3 { margin:0;font-size:21px;line-height:1.4;color:var(--ak-text)!important; }
@@ -5628,7 +5684,7 @@ THEME_INIT_JS = r"""
     pref = localStorage.getItem('akori-sidebar');
   } catch (e) {}
   const small = window.innerWidth <= 900;
-  const collapsed = pref ? pref === 'closed' : small;
+  const collapsed = window.innerWidth <= 700 ? false : (pref ? pref === 'closed' : small);
   document.body.classList.toggle('akori-dark', dark);
   document.body.classList.toggle('dark', dark);
   document.body.classList.toggle('sidebar-collapsed', collapsed);
@@ -5725,7 +5781,7 @@ THEME_INIT_JS = r"""
     setTimeout(alignSidebar, 1200);
     document.addEventListener('click', (ev) => {
       // Écran étroit : après le choix d'une page, le menu se referme pour libérer l'affichage.
-      if (window.innerWidth <= 900 && ev.target.closest('#sidebar .navbtn')) {
+      if (window.innerWidth <= 900 && window.innerWidth > 700 && ev.target.closest('#sidebar .navbtn')) {
         document.body.classList.add('sidebar-collapsed');
         try { localStorage.setItem('akori-sidebar', 'closed'); } catch (e) {}
       }
@@ -5951,6 +6007,28 @@ AKORI_NAV_JS = r"""
     hero.style.setProperty('--mx', (event.clientX - r.left) + 'px');
     hero.style.setProperty('--my', (event.clientY - r.top) + 'px');
   });
+  // Téléphone : menu en tiroir (bouton ☰ flottant), pages pleine largeur
+  const mq = window.matchMedia('(max-width: 700px)');
+  const applyMode = () => {
+    document.body.classList.toggle('m-mode', mq.matches);
+    if (mq.matches) document.body.classList.remove('sidebar-collapsed'); else document.body.classList.remove('m-nav-open');
+  };
+  if (mq.addEventListener) mq.addEventListener('change', applyMode); else mq.addListener(applyMode);
+  applyMode();
+  if (!document.getElementById('m-burger')) {
+    const burger = document.createElement('button');
+    burger.id = 'm-burger'; burger.type = 'button'; burger.setAttribute('aria-label', 'Menu');
+    burger.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg>';
+    const back = document.createElement('div'); back.id = 'm-backdrop';
+    document.body.appendChild(burger); document.body.appendChild(back);
+    burger.addEventListener('click', () => document.body.classList.toggle('m-nav-open'));
+    back.addEventListener('click', () => document.body.classList.remove('m-nav-open'));
+    document.addEventListener('click', (e) => { if (e.target.closest && e.target.closest('#sidebar .navbtn')) window.setTimeout(() => document.body.classList.remove('m-nav-open'), 120); });
+  }
+  window.setInterval(() => {
+    document.body.classList.toggle('in-app', !!document.getElementById('sidebar'));
+    if (mq.matches) document.body.classList.remove('sidebar-collapsed');
+  }, 400);
   // Page de présentation : apparition au défilement, ancres, bouton « Se connecter »
   const lrIO = 'IntersectionObserver' in window ? new IntersectionObserver((entries) => entries.forEach((e) => { if (e.isIntersecting) { e.target.classList.add('in'); lrIO.unobserve(e.target); } }), { threshold: .12 }) : null;
   const scanLr = () => document.querySelectorAll('.lr:not(.in):not([data-lr])').forEach((el) => { el.dataset.lr = '1'; if (lrIO) lrIO.observe(el); else el.classList.add('in'); });
@@ -7549,11 +7627,15 @@ if _BUILD_MODE:
         sys.exit(0)
 elif __name__ == "__main__":
     threading.Thread(target=_prewarm_demo, daemon=True).start()
+    _in_colab = "google.colab" in sys.modules or os.path.isdir("/content")
+    _share = (os.getenv("AKORI_SHARE") == "1") or (_in_colab and os.getenv("AKORI_SHARE") != "0")
+    _server = {} if _in_colab else {"server_name": "0.0.0.0", "server_port": int(os.getenv("PORT") or os.getenv("GRADIO_SERVER_PORT") or 7860)}
     demo.queue(default_concurrency_limit=4, max_size=64).launch(
-        share=True,
+        share=_share,
+        **_server,
         debug=False,
         show_error=True,
-        head='<meta name="google" content="notranslate"><meta http-equiv="Content-Language" content="fr"><script>document.documentElement.setAttribute("translate","no");document.documentElement.lang="fr";</script>',
+        head='<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><meta name="theme-color" content="#4f6df5"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="AKORI"><meta name="google" content="notranslate"><meta http-equiv="Content-Language" content="fr"><script>document.documentElement.setAttribute("translate","no");document.documentElement.lang="fr";</script>',
         theme=theme_akori,
         css=custom_css,
         js=AKORI_NAV_JS,
