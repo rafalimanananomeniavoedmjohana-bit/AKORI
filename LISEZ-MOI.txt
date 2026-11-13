@@ -1,0 +1,7 @@
+Dossier de données d'AKORI
+
+  users.json        comptes (mots de passe chiffrés)
+  users/<compte>/   cours, index, historiques, progression et PDF d'origine de chaque utilisateur
+  activity.log      journal d'activité
+
+Pour retrouver vos données : relancez AKORI avec Google Drive monté, ce dossier est relu automatiquement.
